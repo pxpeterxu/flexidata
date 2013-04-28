@@ -5,8 +5,8 @@ from sqlparse import sql as psql
 from sqlparse import tokens as ptokens
 
 import pymysql
+import pymysql.cursors
 import re
-import pyparsing
 
 from collections import defaultdict
 import settings
@@ -110,8 +110,6 @@ class Cursor(object):
             if cols_to_create or cols_to_modify:
                 alter_table = generate_alter_table(table_name, cols_to_create, cols_to_modify)
                 self.cursor.execute(alter_table)
-
-            stmt
 
         self.conn._refresh_schemas()
 
@@ -227,11 +225,17 @@ def print_token_children(root_token, tabs=0):
 
 
 def insert_find_table_info_tokens(stmt):
+    """
+    Find the tokens representing the table information from an INSERT
+    sqlparse statement, taking advantage that only top-level non-keyword
+    tokens are table names.
+    :param stmt: parsed statement representing an INSERT query
+    :return: the table name and the columns that we are querying
+    """
     query_type_token = stmt.token_next_by_type(0, ptokens.DML)
     search_start_index = stmt.token_index(query_type_token) + 1
 
-    # The parser sucks so we have to take care of two cases; grr should've learned
-    # to write my own parser
+    # The parser sucks so we have to take care of two cases
     function = stmt.token_next_by_instance(search_start_index, psql.Function)
     identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
 
@@ -422,23 +426,23 @@ def make_insert_table_name(table_name, table_group):
     else:
         return table_name
 
+if __name__ == "__main__":
+    conn = Connection(original_conn)
+    cur = conn.cursor()
 
-conn = Connection(original_conn)
-cur = conn.cursor()
+    stmt = sqlparse.parse("INSERT INTO test.test_table (sid, name, college, cash) VALUES"
+                          "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
+    print_token_children(stmt)
+    #insert_replace_table_name(stmt, 'blah_table')
+    #print_token_children(stmt)
 
-stmt = sqlparse.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
-                      "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
-print_token_children(stmt)
-insert_replace_table_name(stmt, 'blah_table')
-print_token_children(stmt)
-
-# cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
-#             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
-# conn.commit()
-# cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
-#             "(909876543,'Harry Yu', 'Saybrook', 12.34, '2014')")
-# conn.commit()
-# cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
-#             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
-# conn.commit()
+    # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
+    #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
+    # conn.commit()
+    # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
+    #             "(909876543,'Harry Yu', 'Saybrook', 12.34, '2014')")
+    # conn.commit()
+    # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
+    #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
+    # conn.commit()
 
