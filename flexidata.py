@@ -111,8 +111,6 @@ class Cursor(object):
                 alter_table = generate_alter_table(table_name, cols_to_create, cols_to_modify)
                 self.cursor.execute(alter_table)
 
-            stmt
-
         self.conn._refresh_schemas()
 
     def execute(self, query, args=None):
@@ -215,6 +213,8 @@ def find_columns_in_where(stmt):
 
 def print_token_children(root_token, tabs=0):
     """
+    For debugging purposes, use this on a sqlparsing parsed Statement to print out the whole tree.
+
     :type root_token: sqlparse.sql.TokenList
     """
     if not root_token.is_group():
@@ -327,6 +327,16 @@ def retrieve_schemas(conn):
 
 
 def group_schemas(tables_info):
+    """
+    Groups the schemas of the different tables by table name so that we have a dict of form:
+    'table_name' => [(subtable_number, subtable_schema)]
+
+    For example, there may be tables test_table, test_table__1, test_table__2 which are part
+    of the same sequence of tables.
+
+    tables_info is a dict of form:
+    'table_name' => {'column_name' => {column_info}, ...}
+    """
     grouped_tables_info = defaultdict(list)
 
     for table_name, cols_info in tables_info.iteritems():
@@ -338,14 +348,17 @@ def group_schemas(tables_info):
             index = -1
         grouped_tables_info[base_table_name].append((index, cols_info))
 
-    grouped_tables_info = {table_name: sorted(sub_tables, reverse=True)
+    grouped_tables_info = {table_name: sorted(sub_tables)
                            for (table_name, sub_tables) in grouped_tables_info.iteritems()}
     return grouped_tables_info
 
 
 def create_schema_from_values(value_sets):
     """
-    Calculates the absolute minimum schema.
+    Calculates the absolute minimum schema required for the values to be set.
+
+    Returns the types (int/double/varchar) as well as the minimum lengths.
+    :rtype list of string, list of int
     """
 
     # Initialize for number of columns
@@ -375,6 +388,15 @@ def create_schema_from_values(value_sets):
 
 
 def generate_column_definitions(col_info):
+    """
+    Based on the given columns, generates a list of strings representing lines to be added
+    to ALTER TABLE or CREATE TABLE.
+
+    :param col_info: tuple with 3 elements for name, type, and length
+    :type col_info: tuple
+    :return: a list of column definitions
+    :rtype: list of str
+    """
     NAME = 0
     TYPE = 1
     LENGTH = 2
@@ -384,7 +406,7 @@ def generate_column_definitions(col_info):
         if col_info[TYPE] == 'varchar':
             length = max(col_info[LENGTH], 255)
             col_str = '{} {}({}) NULL'.format(col_info[NAME], col_info[TYPE],
-                length)
+                      length)
         else:
             col_str = '{} {} NULL'.format(col_info[NAME], col_info[TYPE])
         column_definitions.append(col_str)
@@ -407,6 +429,10 @@ def generate_alter_table(table_name, columns_to_add, columns_to_modify):
 
 
 def calculate_flexibility(sql_type_name):
+    """
+    Converts the string of the type name to how flexible it is. When deciding whether to change
+    the schema, higher flexibility always wins.
+    """
     flexibility = {
         'int': 1,
         'double': 2,
