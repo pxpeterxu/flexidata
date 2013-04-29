@@ -153,6 +153,15 @@ class Cursor(object):
         table_name = select_find_table_name(stmt)
         columns = select_find_columns(stmt, table_name)
 
+        # Get columns in JOIN conditions
+        #[FROM table_references
+        #[WHERE where_condition]
+        #[GROUP BY {col_name | expr | position}
+        #          [ASC | DESC], ... [WITH ROLLUP]]
+        #[HAVING where_condition]
+        #[ORDER BY {col_name | expr | position}
+        #          [ASC | DESC], ...]
+
         # Identify the latest version of each table listed that we need
 
         # Start
@@ -206,6 +215,27 @@ class Cursor(object):
 
     def setoutputsize(self, size, column=None):
         self.cursor.setoutputsizes(size, column)
+
+
+def find_tokens_until_match(token, until_token_filter):
+    """
+    Find all the tokens starting from token and ending before a token that
+    matches one of the token_specs
+    :param token: token to start searching at
+    :type token: sqlparse.sql.Token
+    :param until_token_filter: conditions on the kind of token to stop at. The function
+                              should return True on match, False otherwise
+    :type until_token_filter: function
+    :return: all tokens (including 'token') before a token that matches until_token_specs
+    """
+    cur = token
+    while cur is not None:
+        if until_token_filter(cur):
+            break
+        cur = cur.token_next()
+
+    if cur is None:
+        return
 
 
 def find_tokens_by_instance(tokens, token_class, recursive=False):
@@ -265,15 +295,6 @@ def find_columns_in_where(stmt):
             columns.add((names[0],))
 
     return columns
-
-
-def find_columns_after_keyword(stmt):
-    """
-    Find all column names in a statement following a given keyword
-    :param stmt: parsed statement from sqlparse
-    :return: list of columns after the keyword by their string names
-    """
-    yield
 
 
 def print_token_children(root_token, tabs=0):
@@ -567,7 +588,6 @@ def find_minimum_types_for_values(value_sets):
     Calculates the absolute minimum schema required for the values to be set.
 
     Returns the types (int/double/varchar) as well as the minimum lengths.
-    :type value_sets
     :rtype list of string, list of int
     """
 
@@ -732,11 +752,20 @@ def generate_triggers(old_table, new_table, shared_columns, unique_columns):
 conn = Connection(original_conn)
 cur = conn.cursor()
 
-cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
-            "(10210101, 'George Bush', 'Davenport', 9999999.54)")
-conn.commit()
-cur.execute("UPDATE test_table SET class_year = 1964 WHERE name = 'George Bush'")
-conn.commit()
+stmt = psqle.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
+#insert_replace_table_name(stmt, 'blah_table')
+stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
+                      "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
+print_token_children(stmt)
+stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
+print_token_children(stmt)
+
+# cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
+#             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
+# conn.commit()
+# cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
+#             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
+# conn.commit()
 # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
 #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
 # conn.commit()
