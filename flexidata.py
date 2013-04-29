@@ -4,6 +4,8 @@ import sqlparse
 from sqlparse import sql as psql
 from sqlparse import tokens as ptokens
 
+import sqlparse_enhanced as psqle
+
 import pymysql
 import re
 
@@ -15,7 +17,6 @@ original_conn = pymysql.connect(
     user=settings.flexidata_username,
     passwd=settings.flexidata_password,
     host=settings.flexidata_host)
-
 
 class Connection(object):
     """
@@ -214,10 +215,21 @@ def find_tokens_until_match(token, until_token_filter):
     Find all the tokens starting from token and ending before a token that
     matches one of the token_specs
     :param token: token to start searching at
-    :param until_token_specs: conditions on the kind of token to stop at. The function
+    :type token: sqlparse.sql.Token
+    :param until_token_filter: conditions on the kind of token to stop at. The function
                               should return True on match, False otherwise
+    :type until_token_filter: function
     :return: all tokens (including 'token') before a token that matches until_token_specs
     """
+    cur = token
+    while cur is not None:
+        if until_token_filter(cur):
+            break
+        cur = cur.token_next()
+
+    if cur is None:
+        return
+
 
 def find_tokens_by_instance(tokens, token_class, recursive=False):
     """
@@ -719,12 +731,12 @@ def generate_triggers(old_table, new_table, shared_columns, unique_columns):
 conn = Connection(original_conn)
 cur = conn.cursor()
 
-stmt = sqlparse.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
+stmt = psqle.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
 #insert_replace_table_name(stmt, 'blah_table')
-stmt = sqlparse.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
+stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
 print_token_children(stmt)
-stmt = sqlparse.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC")[0]
+stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
 print_token_children(stmt)
 
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
