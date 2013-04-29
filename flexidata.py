@@ -8,6 +8,7 @@ import sqlparse_enhanced as psqle
 
 import pymysql
 import re
+import itertools
 
 from collections import defaultdict, OrderedDict
 import settings
@@ -141,7 +142,7 @@ class Cursor(object):
         return self._prepare_schema(table_name, query_minimum_schema)
 
     def _prepare_for_update(self, stmt):
-        table_name, row_data, where_columns = update_find_data(stmt)
+        table_name, row_data, _ = update_find_data(stmt)
         types, lengths = find_minimum_types_for_values([row_data.values()])
 
         query_minimum_schema = OrderedDict()
@@ -149,6 +150,15 @@ class Cursor(object):
             query_minimum_schema[info[0]] = {'type': info[1], 'length': info[2]}
 
         return self._prepare_schema(table_name, query_minimum_schema)
+
+    def _insert_data_for_update(self, stmt):
+        _, _, where_token = update_find_tokens(stmt)
+        table_name, _, _ = update_find_data(stmt)
+
+
+
+
+
 
     def _prepare_for_select(self, stmt):
         # Get basic information
@@ -741,26 +751,86 @@ def generate_triggers(old_table, new_table, shared_columns, unique_columns):
                      "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
                      "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
                                                 cols=cols, new_plus_cols=cols_new)
-    # update_trigger = "CREATE TRIGGER {source_table}_insert AFTER UPDATE ON {source_table} \n" \
-    #                  "FOR EACH ROW BEGIN \n" \
-    #                  "  DELETE FROM {dest_table} WHERE ({unique_cols}) = ({unique_cols_old});\n" \
-    #                  "  REPLACE INTO {dest_table} ({cols}) VALUES ({new_plus_cols});" \
-    #                  "END".format(source_table=new_table, dest_table=old_table, cols=cols,
-    #                               new_plus_cols=cols_new, unique_cols=unique_cols,
-    #                               unique_cols_old=unique_cols_old)
-    update_trigger = ""
-    return ';\n'.join((insert_trigger, update_trigger))
+    return ';\n'.join(insert_trigger)
+
+def generate_propagate_arguments_for_table(table_name, table_schemas):
+    """
+    Generates the parameters necessary for forward propagating a table into the delta tables.
+    :return: first_table_name (the left-most table that isn't joined on),
+             a dictionary matching column names to a list of tables that have it: note that
+                the list contains the oldest table versions first
+             join_tables (the set of tables to left join on)
+    :rtype: (str, defaultdict of list, set of str)
+    """
+
+    last_table_columns = {}
+    copy_columns = defaultdict(list)
+
+    for table_info in reversed(table_schemas):
+        table_version = table_info[0]
+        columns = table_info[1]
+        real_table_name = make_real_table_name(table_name, table_version)
+
+        for column_name, type_info in columns.iteritems():
+            # This column was created in this table-version
+            if column_name not in last_table_columns:
+                copy_columns[column_name].append(real_table_name)
+
+            # This column was modified in this table-version
+            elif type_info != last_table_columns[column_name]:
+                copy_columns[column_name].append(real_table_name)
+
+            # Otherwise, this column is the same as the previous version; all changes are back
+            # propagated so we don't need to do anything
+
+        last_table_columns = columns
+
+    first_table = make_real_table_name(table_name, table_schemas[-1][0])
+    join_tables = set(itertools.chain.from_iterable(copy_columns.itervalues()))
+    join_tables.remove(first_table)
+
+    return first_table, copy_columns, join_tables
+
+
+def generate_propagate_sql(table_name, table_schemas, primary_key, where_str):
+    first_table, copy_columns, join_tables = generate_propagate_arguments_for_table(
+        table_name, table_schemas)
+
+    selects = []
+    for column, tables in copy_columns.iteritems():
+        tables = tables.reverse()  # We want the latest versions to come first for the COALESCE
+        columns_str = ', '.join(['{}.{}'.format(table, column, column) for table in tables])
+        if len(tables) == 1:
+            selects.append('{} AS {}'.format(columns_str, column))
+        else:
+            selects.append('COALESCE({}) AS {}'.format(columns_str, column))
+
+    selects = ', '.join(selects)
+
+    left_outer_joins = ['LEFT OUTER JOIN {table} ON' \
+                        '{orig_table}.{primary_key} = {table}.{primary_key}'.format(
+                            table=join_table, orig_table=table_name, primary_key=primary_key)
+                        for join_table in join_tables]
+    left_outer_joins = '\n'.join(left_outer_joins)
+
+    full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
+        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where_str)
+    return full_select
+
+
 
 conn = Connection(original_conn)
 cur = conn.cursor()
 
-stmt = psqle.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
-#insert_replace_table_name(stmt, 'blah_table')
-stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
-                      "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
-print_token_children(stmt)
-stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
-print_token_children(stmt)
+# stmt = psqle.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
+# #insert_replace_table_name(stmt, 'blah_table')
+# stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
+#                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
+# print_token_children(stmt)
+# stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
+# print_token_children(stmt)
+
+generate_propagate_sql('test_table', conn.schemas['test_table'], 'sid', '')
 
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
