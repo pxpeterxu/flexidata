@@ -18,6 +18,7 @@ original_conn = pymysql.connect(
     passwd=settings.flexidata_password,
     host=settings.flexidata_host)
 
+
 class Connection(object):
     """
     Wraps around a DBAPI 2.0 Connection
@@ -112,7 +113,7 @@ class Cursor(object):
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
-                                                       shared_columns)
+                                                       shared_columns, [])
                 self.cursor.execute(create_trigger_sql)
 
             self.conn._refresh_schemas()
@@ -140,7 +141,14 @@ class Cursor(object):
         return self._prepare_schema(table_name, query_minimum_schema)
 
     def _prepare_for_update(self, stmt):
-        pass
+        table_name, row_data, where_columns = update_find_data(stmt)
+        types, lengths = find_minimum_types_for_values([row_data.values()])
+
+        query_minimum_schema = OrderedDict()
+        for info in zip(row_data.keys(), types, lengths):
+            query_minimum_schema[info[0]] = {'type': info[1], 'length': info[2]}
+
+        return self._prepare_schema(table_name, query_minimum_schema)
 
     def _prepare_for_select(self, stmt):
         # Get basic information
@@ -164,7 +172,7 @@ class Cursor(object):
 
 
 
-        return self._prepare_schema(table_name, query_minimum_schema)
+        #return self._prepare_schema(table_name, query_minimum_schema)
 
     def execute(self, query, args=None):
         stmts = sqlparse.parse(query)
@@ -175,6 +183,7 @@ class Cursor(object):
                 insert_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
+                update_replace_table_name(stmt, real_table_name)
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
@@ -366,7 +375,7 @@ def insert_find_values(stmt):
     Find the tokens representing the VALUES to insert in an INSERT query.
     :param stmt: parsed statement tree from sqlparse
     :type stmt: sqlparse.sql.TokenList
-    :return: list of string values to be inserted
+    :return: list of lists of string values to be inserted
     """
     values_keyword = stmt.token_next_match(0, ptokens.Keyword, 'VALUES')
     if values_keyword is None:
@@ -390,11 +399,13 @@ def update_find_data(stmt):
     """
     table_name_token, comparisons, where_comparisons = update_find_tokens(stmt)
 
-    table_name = table_name_token.strip('"`')
+    table_name = str(table_name_token).strip('"`')
     col_values = OrderedDict()
 
     for comparison in comparisons:
-        identifiers = find_tokens_by_instance(comparison.tokens, psql.Identifier)
+        identifiers = find_tokens_by_instance(comparison.tokens, psql.Identifier) + \
+                      find_tokens_by_type(comparison.tokens, ptokens.Literal)
+
         column = str(identifiers[0]).strip('"`')
         value = str(identifiers[1]).strip('"`\'')
         col_values[column] = value
@@ -402,6 +413,7 @@ def update_find_data(stmt):
     where_columns = find_columns_in_where(stmt)
 
     return table_name, col_values, where_columns
+
 
 def update_find_tokens(stmt):
     """
@@ -417,8 +429,8 @@ def update_find_tokens(stmt):
     search_start_index = stmt.token_index(values_keyword) + 1
 
     comparison = stmt.token_next_by_instance(search_start_index, psql.Comparison)
-    identifier_list = stmt.token_next_by_instance(search_start_index, psql.Identifier)
-    if identifier_list is None or (identifier_list is not None and
+    identifier_list = stmt.token_next_by_instance(search_start_index, psql.IdentifierList)
+    if identifier_list is None or (comparison is not None and
                                    stmt.token_index(comparison) < stmt.token_index(identifier_list)):
         comparisons = [comparison]
     else:
@@ -429,6 +441,18 @@ def update_find_tokens(stmt):
                         if where is not None else []
 
     return table_name_token, comparisons, where_comparisons
+
+
+def update_replace_table_name(stmt, table_name):
+    """
+    Given an UPDATE query, find and replace the table name.
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :param table_name: table name for the new INSERT query
+    :type table_name: str
+    """
+    table_name_token, comparisons, where_comparisons = update_find_tokens(stmt)
+    table_name_token.value = table_name
 
 
 def select_find_table_name(stmt):
@@ -708,13 +732,12 @@ def generate_triggers(old_table, new_table, shared_columns, unique_columns):
     Creates a query to create triggers for new columns.
     """
     cols = ', '.join(shared_columns)
-    cols_new = ['NEW.' + col for col in cols]
+    cols_new = ', '.join(['NEW.' + col for col in shared_columns])
 
     unique_cols = ', '.join(unique_columns)
-    unique_cols_old = ['OLD.' + col for col in cols]
+    unique_cols_old = ['OLD.' + col for col in unique_cols]
 
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
-                     "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
                      "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
                      "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
                                                 cols=cols, new_plus_cols=cols_new)
