@@ -29,17 +29,18 @@ Group = ptokens.Group;
 Group.OrderBy = ptokens.Group.OrderBy;
 Group.GroupBy = ptokens.Group.GroupBy;
 Group.Having = ptokens.Group.Having;
+Group.From = ptokens.Group.From;
 
-def group_list(tlist, starting_keyword, group_instance):
+def group_list(tlist, starting_keyword, instance):
     """
     Group tokens together based on the starting keyword (e.g. ORDER, WHERE, etc.)
     :param tlist: parsed token list
     :param starting_keyword: keyword to trigger formation of group
     :type starting_keyword: str
-    :param group_instance: the Class to make the group with
+    :param instance: the Class to make the group with
     """
-    [group_list(sgroup, starting_keyword, group_instance) for sgroup in tlist.get_sublists()
-     if not isinstance(sgroup, group_instance)]
+    [group_list(sgroup, starting_keyword, instance) for sgroup in tlist.get_sublists()
+     if not isinstance(sgroup, instance)]
     idx = 0
     token = tlist.token_next_match(idx, ptokens.Keyword, starting_keyword)
     stopwords = ('WHERE', 'ORDER', 'GROUP', 'LIMIT', 'UNION', 'HAVING')
@@ -50,7 +51,7 @@ def group_list(tlist, starting_keyword, group_instance):
             end = tlist._groupable_tokens[-1]
         else:
             end = tlist.tokens[tlist.token_index(end) - 1]
-        group = tlist.group_tokens(group_instance,
+        group = tlist.group_tokens(instance,
             tlist.tokens_between(token, end),
             ignore_ws=True)
         idx = tlist.token_index(group)
@@ -70,8 +71,9 @@ def group_from(tlist):
 
 def parse(sql):
     parsed = sqlparse.parse(sql)
-    group_order_by(parsed[0])
+    group_from(parsed[0])
     group_group_by(parsed[0])
     group_having(parsed[0])
+    group_order_by(parsed[0])
 
     return parsed
