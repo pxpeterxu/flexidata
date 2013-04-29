@@ -431,7 +431,6 @@ def find_identifiers_with_name_sub_token(tokens):
     """
     found_identifiers = []
     for token in tokens:
-        assert isinstance(token, psql.Identifier)
         if (isinstance(token, psql.Identifier) and
                 token.token_next_by_type(0, ptokens.Name) is not None):
             found_identifiers.append(token)
@@ -950,7 +949,7 @@ def generate_propagate_arguments_for_table(table_name, table_schemas):
 
 
 def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary_key,
-                                  where_str):
+                           where):
     """
     Generates a SELECT for the INSERT INTO... SELECT queries.
     :return: string of SELECT sql
@@ -976,9 +975,11 @@ def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary
                         for join_table in join_tables]
     left_outer_joins = '\n'.join(left_outer_joins)
 
+    replace_identifiers(where.tokens, {table_name: copy_columns})
+
     # TODO(hsource) need to modify where so that it's a where object, and replace primary key refs
     full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
-        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where_str)
+        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where)
 
     insert_columns = ', '.join(copy_columns.keys())
     insert_query = 'INSERT IGNORE INTO {insert_table_name} ({insert_columns}) {select}'.format(
@@ -986,18 +987,76 @@ def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary
 
     return insert_query
 
+
+def infer_table(column, tables_columns):
+    """
+    Infers what table a column is from.
+
+    :type column: str
+    :param tables_columns: a dict of 'table' => {'col' => ['subtable1', ...]}
+    :type tables_columns: dict of (str -> dict of (str -> list of str))
+    :return: the string name of the table; None if it doesn't exist, or False on conflict
+    :rtype: str | None | False
+    """
+    table_found = None
+
+    for table, columns in tables_columns.iteritems():
+        if column in columns:
+            # We've already found a table! This reference is ambiguous, so we just leave it
+            if table_found is not None:
+                return False
+            else:
+                table_found = table
+
+    return table_found
+
+def replace_identifiers(tokens, tables_columns):
+    """
+    Replaces the identifiers in the tokens list.
+
+    :param tokens:
+    :type tokens:
+    :param tables_columns: a dict of 'table' => {'col' => ['subtable1', ...]}
+    :type tables_columns: dict of (str -> dict of (str -> list of str))
+    :rtype:
+    """
+
+    identifiers = find_identifiers_with_name_sub_token(tokens)
+    for identifier in identifiers:
+        table, column = separate_table_and_column(identifier, None)
+        if table is None:
+            table = infer_table(column, tables_columns)
+        if table is None or not table:
+            continue
+
+        real_table_candidates = tables_columns[table][column]
+        if len(real_table_candidates) == 1:
+            real_table = real_table_candidates[0]
+        else:
+            # TODO(hsource) Make it split it up into OR statements if there's multiple tables
+            real_table = real_table_candidates[0]
+        identifier.tokens = [
+            psql.Token(ptokens.Name, real_table),
+            psql.Token(ptokens.Punctuation, '.'),
+            psql.Token(ptokens.Name, column)
+        ]
+
+
+
+
+
 conn = Connection(original_conn)
 cur = conn.cursor()
 
-stmt = psqle.parse("UPDATE `Customers` SET `Contact Name`.`col`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
+stmt = psqle.parse("UPDATE test_table SET cash=394 WHERE name='George Bush'")[0]
 # #insert_replace_table_name(stmt, 'blah_table')
 # stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
+#print_token_children(stmt)
+#stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
 print_token_children(stmt)
-# stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
-# print_token_children(stmt)
-
-#generate_propagate_sql('test_table', conn.schemas['test_table'], 'sid', '')
+where = stmt.token_next_by_instance(0, psql.Where)
+print generate_propagate_sql('test_table__0', 'test_table', conn.schemas['test_table'], 'sid', where)
 
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
