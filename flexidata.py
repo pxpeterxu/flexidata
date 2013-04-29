@@ -201,19 +201,21 @@ class Cursor(object):
                 earliest = schema
                 version, column_info, num_rows = earliest
                 primary_key = column_info.keys()[0]
-                join_strings = make_real_table_name(table, version)
+                join_strings = 'FROM ' + make_real_table_name(table, version)
 
                 continue
 
             version = schema[0]
-            join_strings += ' LEFT OUTER JOIN {0} USING {1}'.format(make_real_table_name(table, version))
+            join_strings += ' LEFT OUTER JOIN {0} USING ({1})'.format(make_real_table_name(table, version), primary_key)
 
         from_token.tokens = psqle.parse(join_strings)
+        print str(stmt)
+
         return stmt
 
 
     def execute(self, query, args=None):
-        stmts = sqlparse.parse(query)
+        stmts = psqle.parse(query)
 
         for stmt in stmts:
             if stmt.token_next_match(0, ptokens.DML, 'INSERT') is not None:
@@ -223,7 +225,9 @@ class Cursor(object):
                 real_table_name = self._prepare_for_update(stmt)
                 update_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
-                stmt = self._prepare_for_select(stmt)
+                # Use advanced query parser
+                print_token_children(stmt)
+                self._prepare_for_select(stmt)
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
@@ -280,24 +284,28 @@ def find_tokens_until_match(token, until_token_filter):
         return
 
 
-def find_tokens_by_instance(tokens, token_class, recursive=False):
+def find_tokens_by_instance(tokens, token_classes, recursive=False, single=False):
     """
     Utility function to find all tokens in a list of tokens that have a given Python type
 
     :type tokens: list of sqlparse.sql.Token
-    :type token_class: sqlparse.sql.Token
+    :type token_classes: list of sqlparse.sql.Token
     :rtype list of sqlparse.sql.Token
     """
     tokens_found = []
+    if type(token_classes) is not list:
+        token_classes = [token_classes]
+
     for token in tokens:
-        if isinstance(token, token_class):
-            tokens_found.append(token)
-        elif recursive and isinstance(token, psql.TokenList):
-            tokens_found += find_tokens_by_instance(token.tokens, token_class, recursive)
+        for token_class in token_classes:
+            if isinstance(token, token_class):
+                tokens_found.append(token)
+            elif recursive and isinstance(token, psql.TokenList):
+                tokens_found += find_tokens_by_instance(token.tokens, token_class, recursive)
     return tokens_found
 
 
-def find_tokens_by_type(tokens, token_type, recursive=False):
+def find_tokens_by_type(tokens, token_types, recursive=False):
     """
     Utility function to find all tokens in a list of tokens with given token type
 
@@ -306,11 +314,15 @@ def find_tokens_by_type(tokens, token_type, recursive=False):
     :rtype list of sqlparse.sql.Token
     """
     tokens_found = []
+    if type(token_types) is not list:
+        token_types = [token_types]
+
     for token in tokens:
-        if token.ttype is not None and token_type in token.ttype.split():
-            tokens_found.append(token)
-        elif recursive and isinstance(token, psql.TokenList):
-            tokens_found += find_tokens_by_type(token.tokens, token_type, recursive)
+        for token_type in token_types:
+            if token.ttype is not None and token_type in token.ttype.split():
+                tokens_found.append(token)
+            elif recursive and isinstance(token, psql.TokenList):
+                tokens_found += find_tokens_by_type(token.tokens, token_type, recursive)
     return tokens_found
 
 
@@ -572,8 +584,10 @@ def select_find_table_name(stmt):
     :type stmt: sqlparse.sql.TokenList
     :return: the table name as a string
     """
-    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "FROM")) + 1
-    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
+
+    from_token = stmt.token_next_by_instance(0, psqle.From)
+    identifiers = find_tokens_by_instance(from_token.tokens, psql.Identifier)
+    identifier = identifiers[0]
     name = identifier.token_next_by_type(0, ptokens.Name)
     return str(name).strip('"`')
 
@@ -586,19 +600,16 @@ def select_find_columns(stmt, default_table):
     :param default_table: the default table's name (for columns not in the form of table.column)
     :return: a list of [(table, column), ...] as strings. * is returned as (None, '*')
     """
-    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "SELECT")) + 1
+    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.DML, "SELECT")) + 1
 
     # TODO(peterxu): This doesn't deal with SELECT (SELECT id...)
-    identifierlist = stmt.token_next_by_instance(search_start_index, psql.IdentifierList)
-    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
+    next = stmt.token_next(search_start_index)
+    if isinstance(next, psql.IdentifierList):
+        identifiers = find_tokens_by_instance(next.tokens, psql.Identifier) +\
+                      find_tokens_by_type(next.tokens, ptokens.Wildcard)
 
-    # If there's no identifierlist, or if the identifier comes before the identifierllist,
-    # we have a SELECT single_column FROM table
-    if identifierlist is None or (identifier is not None
-                            and stmt.token_index(identifier) < stmt.token_index(identifierlist)):
-        identifiers = [identifier]
     else:
-        identifiers = find_tokens_by_instance(identifierlist, psql.Identifier)
+        identifiers = [next]
 
     # Possible schemes
     # table.column AS alias: parsed as
@@ -609,17 +620,13 @@ def select_find_columns(stmt, default_table):
     #       alias (Name)
     # In all cases, the last Name in the identifier is the column
 
-    columns = []
+    columns = set()
     for id in identifiers:
-        name_tokens = find_tokens_by_type(id, ptokens.Name)
-        table = default_table if len(name_tokens) == 1 else name_tokens[0]
-        column = name_tokens[-1]
-
-        # For SELECT *; don't override SELECT table1.*
-        if column == '*' and len(name_tokens) == 1:
-            table = None
-
-        columns.append((str(table), str(column),))
+        if id.ttype == ptokens.Wildcard:
+            # Tokens for "*" in "SELECT *"
+            columns.add((None, id,))
+        else:
+            columns.add(separate_table_and_column(id, default_table))
 
     return columns
 
@@ -939,9 +946,9 @@ cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUE
              "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
 conn.commit()
 
-stmt = psqle.parse("UPDATE test_table SET cash = 1337.13 WHERE sid = 909876541")[0]
-print_token_children(stmt)
-cur.execute("UPDATE test_table SET cash = 1337.13 WHERE sid = 909876541")
+cur.execute("SELECT *, sid FROM test_table")
+r = cur.fetchone()
+print r
 
 conn.commit()
 # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
