@@ -234,6 +234,12 @@ def print_token_children(root_token, tabs=0):
 
 
 def insert_find_table_info_tokens(stmt):
+    """
+    Given an INSERT query, find tokens that relate to the table information
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :return: the token for the name, and the tokens for the column names of the table
+    """
     query_type_token = stmt.token_next_by_type(0, ptokens.DML)
     search_start_index = stmt.token_index(query_type_token) + 1
 
@@ -257,6 +263,12 @@ def insert_find_table_info_tokens(stmt):
 
 
 def insert_find_table_info(stmt):
+    """
+    Given an INSERT query, find and unquote the table name and column identifiers
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :return: the string of the table name, and the strings for the column names of the table
+    """
     name, columns = insert_find_table_info_tokens(stmt)
 
     name = str(name).strip('"`')
@@ -266,13 +278,23 @@ def insert_find_table_info(stmt):
 
 
 def insert_replace_table_name(stmt, table_name):
+    """
+    Given an INSERT query, find and replace the table name.
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :param table_name: table name for the new INSERT query
+    :type table_name: str
+    """
     name, columns = insert_find_table_info_tokens(stmt)
     name.value = table_name
 
 
 def insert_find_values(stmt):
     """
-    :type stmt sqlparse.sql.Statement
+    Find the tokens representing the VALUES to insert in an INSERT query.
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :return: list of string values to be inserted
     """
     values_keyword = stmt.token_next_match(0, ptokens.Keyword, 'VALUES')
     if values_keyword is None:
@@ -290,7 +312,10 @@ def insert_find_values(stmt):
 
 def select_find_table_name(stmt):
     """
-    :type stmt: sqlparse.sql.Statement
+    Find the table name of an INSERT query
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :return: the table name as a string
     """
     search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "FROM")) + 1
     identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
@@ -434,6 +459,21 @@ def generate_create_table(table_name, table_schema):
 
 
 def generate_alter_table(table_name, add_column_schema, modify_column_schema):
+    """
+    Generate an alter table query that adds columns or changes column sizes as
+     needed.
+    :param table_name: name of table to change
+    :type name: str
+    :param add_column_schema: schema of the columns to add with ADD COLUMN in the
+                              form of an OrderedDict with column_name keys and values
+                              of dicts containing 'type' and 'length'
+    :type add_column_schema: OrderedDict
+    :param modify_column_schema: schema of the columns to add with MODIFY COLUMN in the
+                                 form of an OrderedDict with column_name keys and values
+                                 of dicts containing 'type' and 'length'
+    :type modify_column_schema: OrderedDict
+    :return:
+    """
     add_strs = generate_column_definitions(add_column_schema)
     add_strs = ['ADD COLUMN ' + add_line for add_line in add_strs]
     modify_strs = generate_column_definitions(modify_column_schema)
