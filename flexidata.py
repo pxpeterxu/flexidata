@@ -113,8 +113,10 @@ class Cursor(object):
                 old_table_name = make_real_table_name(table_name, old_table_version)
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
+                print shared_columns
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
                                                        shared_columns, [])
+                print create_trigger_sql
                 self.cursor.execute(create_trigger_sql)
 
             self.conn._refresh_schemas()
@@ -839,18 +841,17 @@ def generate_triggers(old_table, new_table, shared_columns, unique_columns):
     """
     Creates a query to create triggers for new columns.
     """
+    cols_new = ', '.join(['NEW.' + col for col in shared_columns])
     cols = ', '.join(shared_columns)
-    cols_new = ['NEW.' + col for col in cols]
 
+    unique_cols_old = ['OLD.' + col for col in unique_columns]
     unique_cols = ', '.join(unique_columns)
-    unique_cols_old = ['OLD.' + col for col in cols]
 
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
                      "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
-                     "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
                      "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
                                                 cols=cols, new_plus_cols=cols_new)
-    return ';\n'.join(insert_trigger)
+    return insert_trigger
 
 def generate_propagate_arguments_for_table(table_name, table_schemas):
     """
@@ -929,14 +930,20 @@ cur = conn.cursor()
 # stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
 # print_token_children(stmt)
 
-generate_propagate_sql('test_table', conn.schemas['test_table'], 'sid', '')
+#generate_propagate_sql('test_table', conn.schemas['test_table'], 'sid', '')
 
-# cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
-#             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
-# conn.commit()
-# cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
-#             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
-# conn.commit()
+cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES" +
+             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
+conn.commit()
+cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES " +
+             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
+conn.commit()
+
+stmt = psqle.parse("UPDATE test_table SET cash = 1337.13 WHERE sid = 909876541")[0]
+print_token_children(stmt)
+cur.execute("UPDATE test_table SET cash = 1337.13 WHERE sid = 909876541")
+
+conn.commit()
 # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
 #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
 # conn.commit()
