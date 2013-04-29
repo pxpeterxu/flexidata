@@ -114,7 +114,7 @@ class Cursor(object):
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
-                                                       shared_columns, [])
+                                                       shared_columns)
                 self.cursor.execute(create_trigger_sql)
 
             self.conn._refresh_schemas()
@@ -737,21 +737,21 @@ def make_real_table_name(table_name, table_index):
     else:
         return table_name
 
-def generate_triggers(old_table, new_table, shared_columns, unique_columns):
+def generate_triggers(old_table, new_table, shared_columns):
     """
     Creates a query to create triggers for new columns.
     """
     cols = ', '.join(shared_columns)
     cols_new = ', '.join(['NEW.' + col for col in shared_columns])
 
-    unique_cols = ', '.join(unique_columns)
-    unique_cols_old = ['OLD.' + col for col in unique_cols]
-
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
-                     "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
-                     "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
-                                                cols=cols, new_plus_cols=cols_new)
-    return ';\n'.join(insert_trigger)
+                     "FOR EACH ROW BEGIN \n" \
+                     "  IF (@DISABLE_TRIGGERS IS NULL) THEN \n" \
+                     "      INSERT INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
+                     "  END IF; \n" \
+                     "END;".format(source_table=new_table, dest_table=old_table,
+                                   cols=cols, new_plus_cols=cols_new)
+    return insert_trigger
 
 def generate_propagate_arguments_for_table(table_name, table_schemas):
     """
@@ -792,14 +792,20 @@ def generate_propagate_arguments_for_table(table_name, table_schemas):
     return first_table, copy_columns, join_tables
 
 
-def generate_propagate_sql(table_name, table_schemas, primary_key, where_str):
+def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary_key,
+                                  where_str):
+    """
+    Generates a SELECT for the INSERT INTO... SELECT queries.
+    :return: string of SELECT sql
+    :rtype: str
+    """
     first_table, copy_columns, join_tables = generate_propagate_arguments_for_table(
         table_name, table_schemas)
 
     selects = []
     for column, tables in copy_columns.iteritems():
-        tables = tables.reverse()  # We want the latest versions to come first for the COALESCE
-        columns_str = ', '.join(['{}.{}'.format(table, column, column) for table in tables])
+        reversed_tables = reversed(tables)  # We want the latest versions to come first for COALESCE
+        columns_str = ', '.join(['{}.{}'.format(table, column) for table in reversed_tables])
         if len(tables) == 1:
             selects.append('{} AS {}'.format(columns_str, column))
         else:
@@ -807,16 +813,21 @@ def generate_propagate_sql(table_name, table_schemas, primary_key, where_str):
 
     selects = ', '.join(selects)
 
-    left_outer_joins = ['LEFT OUTER JOIN {table} ON' \
+    left_outer_joins = ['LEFT OUTER JOIN {table} ON '
                         '{orig_table}.{primary_key} = {table}.{primary_key}'.format(
                             table=join_table, orig_table=table_name, primary_key=primary_key)
                         for join_table in join_tables]
     left_outer_joins = '\n'.join(left_outer_joins)
 
+    # TODO(hsource) need to modify where so that it's a where object, and replace primary key refs
     full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
         selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where_str)
-    return full_select
 
+    insert_columns = ', '.join(copy_columns.keys())
+    insert_query = 'INSERT IGNORE INTO {insert_table_name} ({insert_columns}) {select}'.format(
+        insert_table_name=insert_table_name, insert_columns=insert_columns, select=full_select)
+
+    return insert_query
 
 
 conn = Connection(original_conn)
@@ -830,14 +841,14 @@ cur = conn.cursor()
 # stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
 # print_token_children(stmt)
 
-generate_propagate_sql('test_table', conn.schemas['test_table'], 'sid', '')
+#print generate_propagate_sql('test_table__0', 'test_table', conn.schemas['test_table'], 'sid', '')
 
-# cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
-#             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
-# conn.commit()
-# cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
-#             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
-# conn.commit()
+cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
+            "(10210101, 'George Bush', 'Davenport', 9999999.54)")
+conn.commit()
+cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
+            "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
+conn.commit()
 # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
 #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
 # conn.commit()
