@@ -145,7 +145,6 @@ class Cursor(object):
     def _prepare_for_select(self, stmt):
         # Get basic information
         table_name = select_find_table_name(stmt)
-        columns = select_find_columns(stmt, table_name)
 
         # Get columns in JOIN conditions
         #[FROM table_references
@@ -155,16 +154,18 @@ class Cursor(object):
         #[HAVING where_condition]
         #[ORDER BY {col_name | expr | position}
         #          [ASC | DESC], ...]
+        select_columns = select_find_columns(stmt, table_name)
+        where_columns = select_find_columns(stmt, table_name)
+        having_columns = select_find_columns(stmt, table_name)
+        order_by_columns = find_columns_in_orderby(stmt, table_name)
+        group_by_columns = find_columns_in_groupby(stmt, table_name)
+
+        columns = select_columns | where_columns | having_columns | order_by_columns | group_by_columns
 
         # Identify the latest version of each table listed that we need
 
         # Start
-        schema = self.conn.schemas[table_name]
-
-
-
-
-        return self._prepare_schema(table_name, query_minimum_schema)
+        #schema = self.conn.schemas[table_name]
 
     def execute(self, query, args=None):
         stmts = sqlparse.parse(query)
@@ -175,6 +176,8 @@ class Cursor(object):
                 insert_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
+            if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
+                real_table_name = self._prepare_for_select(stmt)
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
@@ -208,27 +211,6 @@ class Cursor(object):
 
     def setoutputsize(self, size, column=None):
         self.cursor.setoutputsizes(size, column)
-
-
-def find_tokens_until_match(token, until_token_filter):
-    """
-    Find all the tokens starting from token and ending before a token that
-    matches one of the token_specs
-    :param token: token to start searching at
-    :type token: sqlparse.sql.Token
-    :param until_token_filter: conditions on the kind of token to stop at. The function
-                              should return True on match, False otherwise
-    :type until_token_filter: function
-    :return: all tokens (including 'token') before a token that matches until_token_specs
-    """
-    cur = token
-    while cur is not None:
-        if until_token_filter(cur):
-            break
-        cur = cur.token_next()
-
-    if cur is None:
-        return
 
 
 def find_tokens_by_instance(tokens, token_class, recursive=False):
@@ -265,29 +247,114 @@ def find_tokens_by_type(tokens, token_type, recursive=False):
     return tokens_found
 
 
-def find_columns_in_where(stmt):
+def separate_table_and_column(identifier, default_table):
     """
-    Finds all column names in a statement (for seeing if schema change is necessary).
+    Separate the table and column in a column identifier (e.g. table.column, or just `column`)
+    :param identifier: Identifier token
+    :type identifier: sqlparse.sql.Identifier
+    :return (table, column) tuple
+    """
+    # Possible schemes
+    # table.column AS alias: parsed as
+    #   table (Name)
+    #   column (Name)
+    #   AS (Keyword)
+    #   alias (Identifier)
+    #       alias (Name)
+    # In all cases, the last Name in the identifier is the column
 
-    :type stmt: sqlparse.sql.Statement
+    name_tokens = find_tokens_by_type(identifier.tokens, ptokens.Name)
+    names = [str(token).strip('"`') for token in name_tokens]
+    table = default_table if len(names) == 1 else names[0]
+    column = names[-1]
+
+    # For SELECT *; don't override SELECT table1.*
+    if column == '*' and len(name_tokens) == 1:
+        table = None
+
+    return table, column
+
+
+def find_columns_in_condition(stmt, default_table):
     """
+    Find all column names in a WHERE or HAVING statement
+    :param stmt: WHERE or HAVING statement
+    :type stmt: sqlparse.sql.TokenList
+    :return: a set of [(table, column), ...] as strings
+    """
+    comparisons = find_tokens_by_instance(stmt.tokens, psql.Comparison, True)
+
     columns = set()
-    where = stmt.token_next_by_instance(0, psql.Where)
-    assert isinstance(where, psql.Where)
-    comparisons = find_tokens_by_instance(where.tokens, psql.Comparison, True)
-
+    # For each comparison
     for comparison in comparisons:
-        assert isinstance(comparison, psql.Comparison)
         identifier = comparison.token_next_by_instance(0, psql.Identifier)
-        names = find_tokens_by_type(identifier.tokens, ptokens.Name)
-        names = [str(name).strip('"`') for name in names]
-        assert 1 <= len(names) <= 2
-        if len(names) == 2:
-            columns.add((names[0], names[1]))
-        else:
-            columns.add((names[0],))
+        if identifier is not None:
+            columns.add(separate_table_and_column(identifier, default_table))
 
     return columns
+
+
+def find_columns_in_where(stmt, default_table):
+    """
+    Find all column names in a WHERE statement
+    :param stmt: top-level parsed SQL statement
+    :param default_table: default table to assume for unqualified columns
+    :return: a set of [(table, column), ...] as strings
+    """
+    where = stmt.token_next_by_instance(0, psql.Where)
+    if where is None:
+        return set()
+    return find_columns_in_condition(where, default_table)
+
+
+def find_columns_in_having(stmt, default_table):
+    """
+    Find all column names in a HAVING statement
+    :param stmt: top-level parsed SQL statement
+    :param default_table: default table to assume for unqualified columns
+    :return: a set of [(table, column), ...] as strings
+    """
+    having = stmt.token_next_by_instance(0, psqle.Having)
+    if having is None:
+        return set()
+    return find_columns_in_condition(having, default_table)
+
+
+def find_columns_in_orderby(stmt, default_table):
+    """
+    Find all column names in an ORDER BY
+    :param stmt: top-level parsed SQL statement
+    :param default_table: default table to assume for unqualified columns
+    :return: a set of [(table, column), ...] as strings
+    """
+    order_by = stmt.token_next_by_instance(0, psqle.OrderBy)
+    if order_by is None:
+        return set()
+    return find_columns_in_orderby_groupby(order_by, default_table)
+
+
+def find_columns_in_groupby(stmt, default_table):
+    """
+    Find all column names in an GROUP BY
+    :param stmt: top-level parsed SQL statement
+    :param default_table: default table to assume for unqualified columns
+    :return: a set of [(table, column), ...] as strings
+    """
+    group_by = stmt.token_next_by_instance(0, psqle.GroupBy)
+    if group_by is None:
+        return set()
+    return find_columns_in_orderby_groupby(group_by, default_table)
+
+
+def find_columns_in_orderby_groupby(stmt, default_table):
+    """
+    Find all column names in an ORDER BY or GROUP BY statement
+    :param stmt: ORDER BY or GROUP BY statement
+    :type stmt: sqlparse.sql.TokenList
+    :return: a set of [(table, column), ...] as strings
+    """
+    identifiers = find_tokens_by_instance(stmt.tokens, psql.Identifier)
+    return set(separate_table_and_column(id, default_table) for id in identifiers)
 
 
 def print_token_children(root_token, tabs=0):
@@ -399,7 +466,7 @@ def update_find_data(stmt):
         value = str(identifiers[1]).strip('"`\'')
         col_values[column] = value
 
-    where_columns = find_columns_in_where(stmt)
+    where_columns = find_columns_in_where(stmt, table_name)
 
     return table_name, col_values, where_columns
 
@@ -452,7 +519,7 @@ def select_find_columns(stmt, default_table):
     :param default_table: the default table's name (for columns not in the form of table.column)
     :return: a list of [(table, column), ...] as strings. * is returned as (None, '*')
     """
-    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "SELECT")) + 1
+    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword.DML, "SELECT")) + 1
 
     # TODO(peterxu): This doesn't deal with SELECT (SELECT id...)
     identifierlist = stmt.token_next_by_instance(search_start_index, psql.IdentifierList)
@@ -464,30 +531,9 @@ def select_find_columns(stmt, default_table):
                             and stmt.token_index(identifier) < stmt.token_index(identifierlist)):
         identifiers = [identifier]
     else:
-        identifiers = find_tokens_by_instance(identifierlist, psql.Identifier)
+        identifiers = find_tokens_by_instance(identifierlist.tokens, psql.Identifier)
 
-    # Possible schemes
-    # table.column AS alias: parsed as
-    #   table (Name)
-    #   column (Name)
-    #   AS (Keyword)
-    #   alias (Identifier)
-    #       alias (Name)
-    # In all cases, the last Name in the identifier is the column
-
-    columns = []
-    for id in identifiers:
-        name_tokens = find_tokens_by_type(id, ptokens.Name)
-        table = default_table if len(name_tokens) == 1 else name_tokens[0]
-        column = name_tokens[-1]
-
-        # For SELECT *; don't override SELECT table1.*
-        if column == '*' and len(name_tokens) == 1:
-            table = None
-
-        columns.append((str(table), str(column),))
-
-    return columns
+    return set(separate_table_and_column(id, default_table) for id in identifiers)
 
 
 def extract_type_data(type_str):
@@ -736,8 +782,9 @@ stmt = psqle.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`Conta
 stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
 print_token_children(stmt)
-stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
+stmt = psqle.parse("SELECT id AS tableId, uid, table2.field, `blah` FROM table1  GROUP BY id DESC")[0]
 print_token_children(stmt)
+cur._prepare_for_select(stmt)
 
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")

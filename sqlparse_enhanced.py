@@ -19,6 +19,10 @@ class Having(psql.TokenList):
     """A HAVING clause."""
     __slots__ = ('value', 'ttype', 'tokens')
 
+class From(psql.TokenList):
+    """A FROM clause for SELECTs."""
+    __slots__ = ('value', 'ttype', 'tokens')
+
 Group = ptokens.Group;
 
 # These are actually weird ways of instantiating new types
@@ -60,6 +64,9 @@ def group_group_by(tlist):
 
 def group_having(tlist):
     group_list(tlist, 'HAVING', Having)
+
+def group_from(tlist):
+    group_list(tlist, 'FROM', From)
 
 def parse(sql):
     parsed = sqlparse.parse(sql)
