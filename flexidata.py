@@ -114,7 +114,7 @@ class Cursor(object):
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
-                                                       shared_columns, [])
+                                                       shared_columns)
                 self.cursor.execute(create_trigger_sql)
 
             self.conn._refresh_schemas()
@@ -163,7 +163,6 @@ class Cursor(object):
     def _prepare_for_select(self, stmt):
         # Get basic information
         table_name = select_find_table_name(stmt)
-        columns = select_find_columns(stmt, table_name)
 
         # Get columns in JOIN conditions
         #[FROM table_references
@@ -173,19 +172,45 @@ class Cursor(object):
         #[HAVING where_condition]
         #[ORDER BY {col_name | expr | position}
         #          [ASC | DESC], ...]
+        select_columns = select_find_columns(stmt, table_name)
+        where_columns = find_columns_in_where(stmt, table_name)
+        having_columns = find_columns_in_having(stmt, table_name)
+        order_by_columns = find_columns_in_orderby(stmt, table_name)
+        group_by_columns = find_columns_in_groupby(stmt, table_name)
+
+        columns = select_columns | where_columns | having_columns | order_by_columns | group_by_columns
+        tables = set(table for table, column in columns)
+        table = table_name
+
+        schemas = self.conn.schemas
+
+        #if table not in schemas:
+            #return stmt
 
         # Identify the latest version of each table listed that we need
+        # TODO(peterxu): the above. Right now, we just join all possible versions
+        # TODO(peterxu): allow for joins with multiple tables
 
-        # Start
-        schema = self.conn.schemas[table_name]
+        from_token = stmt.token_next_by_instance(0, psqle.From)
 
+        earliest = None
+        for schema in reversed(schemas[table]):
+            if earliest is None:
+                earliest = schema
+                version, column_info, num_rows = earliest
+                primary_key = column_info.keys()[0]
+                join_strings = make_real_table_name(table, version)
 
+                continue
 
+            version = schema[0]
+            join_strings += ' LEFT OUTER JOIN {0} USING {1}'.format(make_real_table_name(table, version))
 
-        #return self._prepare_schema(table_name, query_minimum_schema)
+        from_token.tokens = psqle.parse(join_strings)
+        return stmt
 
     def execute(self, query, args=None):
-        stmts = sqlparse.parse(query)
+        stmts = psqle.parse(query)
 
         for stmt in stmts:
             if stmt.token_next_match(0, ptokens.DML, 'INSERT') is not None:
@@ -194,6 +219,10 @@ class Cursor(object):
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
                 update_replace_table_name(stmt, real_table_name)
+            if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
+                # Use advanced query parser
+                print_token_children(stmt)
+                self._prepare_for_select(stmt)
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
@@ -293,11 +322,11 @@ def separate_table_and_column(identifier, default_table):
     """
     # Possible schemes
     # table.column AS alias: parsed as
-    # table (Name)
-    # column (Name)
-    # AS (Keyword)
-    # alias (Identifier)
-    # alias (Name)
+    #   table (Name)
+    #   column (Name)
+    #   AS (Keyword)
+    #   alias (Identifier)
+    #       alias (Name)
     # In all cases, the last Name in the identifier is the column
 
     name_tokens = find_tokens_by_type(identifier.tokens, ptokens.Name)
@@ -865,21 +894,21 @@ def make_real_table_name(table_name, table_index):
     else:
         return table_name
 
-def generate_triggers(old_table, new_table, shared_columns, unique_columns):
+def generate_triggers(old_table, new_table, shared_columns):
     """
     Creates a query to create triggers for new columns.
     """
     cols = ', '.join(shared_columns)
     cols_new = ', '.join(['NEW.' + col for col in shared_columns])
 
-    unique_cols = ', '.join(unique_columns)
-    unique_cols_old = ['OLD.' + col for col in unique_cols]
-
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
-                     "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
-                     "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
-                                                cols=cols, new_plus_cols=cols_new)
-    return ';\n'.join(insert_trigger)
+                     "FOR EACH ROW BEGIN \n" \
+                     "  IF (@DISABLE_TRIGGERS IS NULL) THEN \n" \
+                     "      INSERT INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
+                     "  END IF; \n" \
+                     "END;".format(source_table=new_table, dest_table=old_table,
+                                   cols=cols, new_plus_cols=cols_new)
+    return insert_trigger
 
 def generate_propagate_arguments_for_table(table_name, table_schemas):
     """
@@ -920,31 +949,20 @@ def generate_propagate_arguments_for_table(table_name, table_schemas):
     return first_table, copy_columns, join_tables
 
 
-def replace_table_names(where, default_table, table_columns_to_tables):
+def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary_key,
+                                  where_str):
     """
-    Replace the table names in a parsed WHERE clause.
-
-    :param where:
-    :type where:
-    :param table_columns_to_tables:
-    :type table_columns_to_tables:
-    :return:
-    :rtype:
+    Generates a SELECT for the INSERT INTO... SELECT queries.
+    :return: string of SELECT sql
+    :rtype: str
     """
-    identifiers = find_identifiers_with_name_sub_token(where.tokens)
-    for identifier in identifiers:
-    #if separate_table_and_column(identifier, )
-        pass
-
-
-def generate_propagate_sql(table_name, table_schemas, primary_key, where):
     first_table, copy_columns, join_tables = generate_propagate_arguments_for_table(
         table_name, table_schemas)
 
     selects = []
     for column, tables in copy_columns.iteritems():
-        tables = tables.reverse()  # We want the latest versions to come first for the COALESCE
-        columns_str = ', '.join(['{}.{}'.format(table, column, column) for table in tables])
+        reversed_tables = reversed(tables)  # We want the latest versions to come first for COALESCE
+        columns_str = ', '.join(['{}.{}'.format(table, column) for table in reversed_tables])
         if len(tables) == 1:
             selects.append('{} AS {}'.format(columns_str, column))
         else:
@@ -952,17 +970,21 @@ def generate_propagate_sql(table_name, table_schemas, primary_key, where):
 
     selects = ', '.join(selects)
 
-    left_outer_joins = ['LEFT OUTER JOIN {table} ON' \
+    left_outer_joins = ['LEFT OUTER JOIN {table} ON '
                         '{orig_table}.{primary_key} = {table}.{primary_key}'.format(
                             table=join_table, orig_table=table_name, primary_key=primary_key)
                         for join_table in join_tables]
     left_outer_joins = '\n'.join(left_outer_joins)
 
+    # TODO(hsource) need to modify where so that it's a where object, and replace primary key refs
     full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
-        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where)
-    return full_select
+        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where_str)
 
+    insert_columns = ', '.join(copy_columns.keys())
+    insert_query = 'INSERT IGNORE INTO {insert_table_name} ({insert_columns}) {select}'.format(
+        insert_table_name=insert_table_name, insert_columns=insert_columns, select=full_select)
 
+    return insert_query
 
 conn = Connection(original_conn)
 cur = conn.cursor()
