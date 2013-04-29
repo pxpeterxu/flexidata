@@ -143,6 +143,15 @@ class Cursor(object):
         table_name = select_find_table_name(stmt)
         columns = select_find_columns(stmt, table_name)
 
+        # Get columns in JOIN conditions
+        #[FROM table_references
+        #[WHERE where_condition]
+        #[GROUP BY {col_name | expr | position}
+        #          [ASC | DESC], ... [WITH ROLLUP]]
+        #[HAVING where_condition]
+        #[ORDER BY {col_name | expr | position}
+        #          [ASC | DESC], ...]
+
         # Identify the latest version of each table listed that we need
 
         # Start
@@ -194,6 +203,16 @@ class Cursor(object):
     def setoutputsize(self, size, column=None):
         self.cursor.setoutputsizes(size, column)
 
+
+def find_tokens_until_match(token, until_token_filter):
+    """
+    Find all the tokens starting from token and ending before a token that
+    matches one of the token_specs
+    :param token: token to start searching at
+    :param until_token_specs: conditions on the kind of token to stop at. The function
+                              should return True on match, False otherwise
+    :return: all tokens (including 'token') before a token that matches until_token_specs
+    """
 
 def find_tokens_by_instance(tokens, token_class, recursive=False):
     """
@@ -252,15 +271,6 @@ def find_columns_in_where(stmt):
             columns.add((names[0],))
 
     return columns
-
-
-def find_columns_after_keyword(stmt):
-    """
-    Find all column names in a statement following a given keyword
-    :param stmt: parsed statement from sqlparse
-    :return: list of columns after the keyword by their string names
-    """
-    yield
 
 
 def print_token_children(root_token, tabs=0):
@@ -649,7 +659,7 @@ cur = conn.cursor()
 stmt = sqlparse.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
 print_token_children(stmt)
-stmt = sqlparse.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 INNER JOIN table2 ON uid")[0]
+stmt = sqlparse.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC")[0]
 print_token_children(stmt)
 insert_replace_table_name(stmt, 'blah_table')
 print_token_children(stmt)
