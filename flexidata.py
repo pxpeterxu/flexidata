@@ -29,11 +29,17 @@ class Connection(object):
         self.conn = conn
         self._refresh_schemas()
 
+    def begin(self):
+        self.conn.begin()
+        self._refresh_schemas()
+
     def close(self):
         self.conn.close()
 
     def commit(self):
         self.conn.commit()
+        # New transaction, so refresh schema
+        self._refresh_schemas()
 
     def rollback(self):
         self.conn.rollback()
@@ -44,6 +50,8 @@ class Connection(object):
     def _refresh_schemas(self):
         self.schemas, self.num_rows = retrieve_schemas(self.conn)
         self.schemas = group_schemas(self.schemas, self.num_rows)
+        # self.schemas is in the form of
+        # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
 
 
 class Cursor(object):
@@ -74,7 +82,6 @@ class Cursor(object):
         self.cursor.close()
 
     def _prepare_schema(self, table_name, query_schema):
-        self.conn._refresh_schemas()
         schemas = self.conn.schemas
 
         # Finds existing table schema
@@ -113,7 +120,13 @@ class Cursor(object):
 
         return real_table_name
 
+
     def _prepare_for_insert(self, stmt):
+        """
+        Prepare for an insert
+        :param stmt:
+        :return:
+        """
         table_name, columns = insert_find_table_info(stmt)
         value_sets = insert_find_values(stmt)
         types, lengths = find_minimum_types_for_values(value_sets)
@@ -122,6 +135,21 @@ class Cursor(object):
         query_minimum_schema = OrderedDict()
         for info in zip(columns, types, lengths):
             query_minimum_schema[info[0]] = {'type': info[1], 'length': info[2]}
+
+        return self._prepare_schema(table_name, query_minimum_schema)
+
+    def _prepare_for_select(self, stmt):
+        # Get basic information
+        table_name = select_find_table_name(stmt)
+        columns = select_find_columns(stmt, table_name)
+
+        # Identify the latest version of each table listed that we need
+
+        # Start
+        schema = self.conn.schemas[table_name]
+
+
+
 
         return self._prepare_schema(table_name, query_minimum_schema)
 
@@ -226,6 +254,15 @@ def find_columns_in_where(stmt):
     return columns
 
 
+def find_columns_after_keyword(stmt):
+    """
+    Find all column names in a statement following a given keyword
+    :param stmt: parsed statement from sqlparse
+    :return: list of columns after the keyword by their string names
+    """
+    yield
+
+
 def print_token_children(root_token, tabs=0):
     """
     For debugging purposes, use this on a sqlparsing parsed Statement to print out the whole tree.
@@ -320,7 +357,7 @@ def insert_find_values(stmt):
 
 def select_find_table_name(stmt):
     """
-    Find the table name of an INSERT query
+    Find the table name of a SELECT query with only a single table
     :param stmt: parsed statement tree from sqlparse
     :type stmt: sqlparse.sql.TokenList
     :return: the table name as a string
@@ -329,6 +366,52 @@ def select_find_table_name(stmt):
     identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
     name = identifier.token_next_by_type(0, ptokens.Name)
     return str(name).strip('"`')
+
+
+def select_find_columns(stmt, default_table):
+    """
+    Find the columns to be selected from a query
+    :param stmt: parsed statement tree from sqlparse
+    :type stmt: sqlparse.sql.TokenList
+    :param default_table: the default table's name (for columns not in the form of table.column)
+    :return: a list of [(table, column), ...] as strings. * is returned as (None, '*')
+    """
+    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "SELECT")) + 1
+
+    # TODO(peterxu): This doesn't deal with SELECT (SELECT id...)
+    identifierlist = stmt.token_next_by_instance(search_start_index, psql.IdentifierList)
+    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
+
+    # If there's no identifierlist, or if the identifier comes before the identifierllist,
+    # we have a SELECT single_column FROM table
+    if identifierlist is None or (identifier is not None
+                            and stmt.token_index(identifier) < stmt.token_index(identifierlist)):
+        identifiers = [identifier]
+    else:
+        identifiers = find_tokens_by_instance(identifierlist, psql.Identifier)
+
+    # Possible schemes
+    # table.column AS alias: parsed as
+    #   table (Name)
+    #   column (Name)
+    #   AS (Keyword)
+    #   alias (Identifier)
+    #       alias (Name)
+    # In all cases, the last Name in the identifier is the column
+
+    columns = []
+    for id in identifiers:
+        name_tokens = find_tokens_by_type(id, ptokens.Name)
+        table = default_table if len(name_tokens) == 1 else name_tokens[0]
+        column = name_tokens[-1]
+
+        # For SELECT *; don't override SELECT table1.*
+        if column == '*' and len(name_tokens) == 1:
+            table = None
+
+        columns.append((str(table), str(column),))
+
+    return columns
 
 
 def extract_type_data(type_str):
@@ -553,7 +636,7 @@ def generate_triggers(old_table, new_table, shared_columns):
     new_plus_cols = ['NEW.' + col for col in cols]
 
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
-                     "FOR EACH ROW REPLACE INTO {dest_table} ({cols}) VALUES \n" \
+                     "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
                      "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
                                                 cols=cols, new_plus_cols=new_plus_cols)
 
@@ -565,6 +648,8 @@ cur = conn.cursor()
 
 stmt = sqlparse.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
+print_token_children(stmt)
+stmt = sqlparse.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 INNER JOIN table2 ON uid")[0]
 print_token_children(stmt)
 insert_replace_table_name(stmt, 'blah_table')
 print_token_children(stmt)
