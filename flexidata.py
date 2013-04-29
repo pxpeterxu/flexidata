@@ -138,6 +138,9 @@ class Cursor(object):
 
         return self._prepare_schema(table_name, query_minimum_schema)
 
+    def _prepare_for_update(self, stmt):
+        pass
+
     def _prepare_for_select(self, stmt):
         # Get basic information
         table_name = select_find_table_name(stmt)
@@ -169,6 +172,8 @@ class Cursor(object):
             if stmt.token_next_match(0, ptokens.DML, 'INSERT') is not None:
                 real_table_name = self._prepare_for_insert(stmt)
                 insert_replace_table_name(stmt, real_table_name)
+            if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
+                real_table_name = self._prepare_for_update(stmt)
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
@@ -363,6 +368,55 @@ def insert_find_values(stmt):
         values = [str(value).strip('"`\'') for value in values]
         value_sets.append(values)
     return value_sets
+
+
+def update_find_data(stmt):
+    """
+    Extracts data relating to an UPDATE query.
+
+    @returns table_name, col_value mapping dict, where_columns
+    """
+    table_name_token, comparisons, where_comparisons = update_find_tokens(stmt)
+
+    table_name = table_name_token.strip('"`')
+    col_values = OrderedDict()
+
+    for comparison in comparisons:
+        identifiers = find_tokens_by_instance(comparison.tokens, psql.Identifier)
+        column = str(identifiers[0]).strip('"`')
+        value = str(identifiers[1]).strip('"`\'')
+        col_values[column] = value
+
+    where_columns = find_columns_in_where(stmt)
+
+    return table_name, col_values, where_columns
+
+def update_find_tokens(stmt):
+    """
+    Finds table_name, comparisons, and where_comparisons objects within the statement given.
+    """
+    query_type_token = stmt.token_next_by_type(0, ptokens.DML)
+    search_start_index = stmt.token_index(query_type_token) + 1
+
+    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
+    table_name_token = identifier.tokens[0]
+
+    values_keyword = stmt.token_next_match(0, ptokens.Keyword, 'SET')
+    search_start_index = stmt.token_index(values_keyword) + 1
+
+    comparison = stmt.token_next_by_instance(search_start_index, psql.Comparison)
+    identifier_list = stmt.token_next_by_instance(search_start_index, psql.Identifier)
+    if identifier_list is None or (identifier_list is not None and
+                                   stmt.token_index(comparison) < stmt.token_index(identifier_list)):
+        comparisons = [comparison]
+    else:
+        comparisons = find_tokens_by_instance(identifier_list.tokens, psql.Comparison)
+
+    where = stmt.token_next_by_instance(0, psql.Where)
+    where_comparisons = find_tokens_by_instance(where.tokens, psql.Comparison) \
+                        if where is not None else []
+
+    return table_name_token, comparisons, where_comparisons
 
 
 def select_find_table_name(stmt):
@@ -564,7 +618,6 @@ def generate_alter_table(table_name, add_column_schema, modify_column_schema):
     Generate an alter table query that adds columns or changes column sizes as
      needed.
     :param table_name: name of table to change
-    :type name: str
     :param add_column_schema: schema of the columns to add with ADD COLUMN in the
                               form of an OrderedDict with column_name keys and values
                               of dicts containing 'type' and 'length'
@@ -638,39 +691,49 @@ def make_real_table_name(table_name, table_index):
     else:
         return table_name
 
-def generate_triggers(old_table, new_table, shared_columns):
+def generate_triggers(old_table, new_table, shared_columns, unique_columns):
     """
     Creates a query to create triggers for new columns.
     """
     cols = ', '.join(shared_columns)
-    new_plus_cols = ['NEW.' + col for col in cols]
+    cols_new = ['NEW.' + col for col in cols]
+
+    unique_cols = ', '.join(unique_columns)
+    unique_cols_old = ['OLD.' + col for col in cols]
 
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
                      "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
+                     "FOR EACH ROW INSERT INTO {dest_table} ({cols}) VALUES \n" \
                      "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
-                                                cols=cols, new_plus_cols=new_plus_cols)
-
-    return insert_trigger
-
+                                                cols=cols, new_plus_cols=cols_new)
+    # update_trigger = "CREATE TRIGGER {source_table}_insert AFTER UPDATE ON {source_table} \n" \
+    #                  "FOR EACH ROW BEGIN \n" \
+    #                  "  DELETE FROM {dest_table} WHERE ({unique_cols}) = ({unique_cols_old});\n" \
+    #                  "  REPLACE INTO {dest_table} ({cols}) VALUES ({new_plus_cols});" \
+    #                  "END".format(source_table=new_table, dest_table=old_table, cols=cols,
+    #                               new_plus_cols=cols_new, unique_cols=unique_cols,
+    #                               unique_cols_old=unique_cols_old)
+    update_trigger = ""
+    return ';\n'.join((insert_trigger, update_trigger))
 
 conn = Connection(original_conn)
 cur = conn.cursor()
 
+stmt = sqlparse.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`ContactName`='Alfred Schmidt' WHERE CustomerName='Alfreds Futterkiste' AND Country='Germany'")[0]
+#insert_replace_table_name(stmt, 'blah_table')
 stmt = sqlparse.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
 print_token_children(stmt)
 stmt = sqlparse.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC")[0]
 print_token_children(stmt)
-insert_replace_table_name(stmt, 'blah_table')
-print_token_children(stmt)
 
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
 # conn.commit()
-cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
-            "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
-conn.commit()
+# cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
+#             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
+# conn.commit()
 # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
 #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
-conn.commit()
+# conn.commit()
 
