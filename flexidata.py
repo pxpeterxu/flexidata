@@ -6,9 +6,8 @@ from sqlparse import tokens as ptokens
 
 import pymysql
 import re
-import pyparsing
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import settings
 
 original_conn = pymysql.connect(
@@ -43,7 +42,8 @@ class Connection(object):
         return Cursor(self.conn.cursor(), self)
 
     def _refresh_schemas(self):
-        self.schemas = group_schemas(retrieve_schemas(self.conn))
+        self.schemas, self.num_rows = retrieve_schemas(self.conn)
+        self.schemas = group_schemas(self.schemas, self.num_rows)
 
 
 class Cursor(object):
@@ -73,53 +73,60 @@ class Cursor(object):
     def close(self):
         self.cursor.close()
 
-    def _prepare_for_insert(self, stmt):
+    def _prepare_schema(self, table_name, query_schema):
         self.conn._refresh_schemas()
         schemas = self.conn.schemas
 
+        # Finds existing table schema
+        if table_name not in schemas:
+            original_schema = {}
+            old_table_index = None
+            new_table_index = -1
+        else:
+            original_schema = schemas[table_name][0][1]
+            old_table_index = schemas[table_name][0][0]
+            new_table_index = old_table_index + 1
+
+        # Check what we need to change
+        create_schema, add_schema, modify_schema = generate_new_schema(
+            original_schema, query_schema)
+
+        # If we need to change the schema
+        if add_schema or modify_schema:
+            # TODO(hsource) Currently all and any schema changes result in a new table; wasteful
+            real_table_name = make_real_table_name(table_name, new_table_index)
+            create_table_sql = generate_create_table(real_table_name, create_schema)
+            self.cursor.execute(create_table_sql)
+            if old_table_index is not None:
+                create_trigger_sql = generate_triggers(old_table, new_table, shared_columns)
+            self.conn._refresh_schemas()
+        else:
+            real_table_name = make_real_table_name(table_name, schemas[table_name][0][0])
+
+        return real_table_name
+
+    def _prepare_for_insert(self, stmt):
         table_name, columns = insert_find_table_info(stmt)
         value_sets = insert_find_values(stmt)
-        types, lengths = create_schema_from_values(value_sets)
+        types, lengths = find_minimum_types_for_values(value_sets)
 
-        if table_name not in schemas:
-            create_table = generate_create_table(table_name, columns, types, lengths)
-            self.cursor.execute(create_table)
+        # Finds query schema
+        query_minimum_schema = OrderedDict()
+        for info in zip(columns, types, lengths):
+            query_minimum_schema[info[0]] = {'type': info[1], 'length': info[2]}
 
-        else:
-            table_name = make_insert_table_name(table_name, schemas[table_name])
-            table_info = schemas[table_name][0][1]
-            cols_to_create = []
-            cols_to_modify = []
-
-            # Table already exists; verify we can insert into it
-            for i in range(0, len(types)):
-                col_name = columns[i]
-                col_type = types[i]
-                col_length = lengths[i]
-
-                if col_name not in table_info:
-                    cols_to_create.append((col_name, col_type, col_length))
-                    continue
-
-                existing_type = table_info[col_name]['type']
-                existing_length = table_info[col_name]['length']
-                if (calculate_flexibility(col_type) > calculate_flexibility(existing_type) or
-                    col_length > existing_length):
-                    cols_to_modify.append((col_name, col_type, col_length))
-
-            if cols_to_create or cols_to_modify:
-                alter_table = generate_alter_table(table_name, cols_to_create, cols_to_modify)
-                self.cursor.execute(alter_table)
-
-        self.conn._refresh_schemas()
+        return self._prepare_schema(table_name, query_minimum_schema)
 
     def execute(self, query, args=None):
         stmts = sqlparse.parse(query)
 
         for stmt in stmts:
             if stmt.token_next_match(0, ptokens.DML, 'INSERT') is not None:
-                self._prepare_for_insert(stmt)
+                real_table_name = self._prepare_for_insert(stmt)
+                insert_replace_table_name(stmt, real_table_name)
 
+        stmts = [str(stmt) for stmt in stmts]
+        query = ';\n'.join(stmts)
         return self.cursor.execute(query, args)
 
     def executemany(self, query, args):
@@ -310,6 +317,9 @@ def retrieve_schemas(conn):
     Gathers schema data from the raw (non-wrapped connection).
 
     :type conn: pymysql.connections.Connection
+    :returns two dicts, one containing a table_name -> {'col' -> col_info} and the other containing
+             table_name -> num_rows
+    :rtype tuple of dict, integer
     """
     cur = conn.cursor()
     cur.execute('SHOW TABLES')
@@ -320,16 +330,22 @@ def retrieve_schemas(conn):
     tables_info = {}
     for table in tables:
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
-        tables_info[table] = {col_info[u'Field']: extract_type_data(col_info[u'Type'])
-                              for col_info in cur.fetchall()}
+        tables_info[table] = OrderedDict()
+        for col_info in cur.fetchall():
+            tables_info[table][col_info[u'Field']] = extract_type_data(col_info[u'Type'])
 
-    return tables_info
+    cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
+                "'{}'".format(conn.db))
+    tables_num_rows = {col_info[u'TABLE_NAME']: int(col_info['TABLE_ROWS'])
+                       for col_info in cur.fetchall()}
+
+    return tables_info, tables_num_rows
 
 
-def group_schemas(tables_info):
+def group_schemas(tables_info, tables_num_rows):
     """
     Groups the schemas of the different tables by table name so that we have a dict of form:
-    'table_name' => [(subtable_number, subtable_schema)]
+    'table_name' => [(subtable_number, subtable_schema, num_rows)]
 
     For example, there may be tables test_table, test_table__1, test_table__2 which are part
     of the same sequence of tables.
@@ -346,14 +362,14 @@ def group_schemas(tables_info):
         else:
             base_table_name = table_name
             index = -1
-        grouped_tables_info[base_table_name].append((index, cols_info))
+        grouped_tables_info[base_table_name].append((index, cols_info, tables_num_rows[table_name]))
 
-    grouped_tables_info = {table_name: sorted(sub_tables)
+    grouped_tables_info = {table_name: sorted(sub_tables, reverse=True)
                            for (table_name, sub_tables) in grouped_tables_info.iteritems()}
     return grouped_tables_info
 
 
-def create_schema_from_values(value_sets):
+def find_minimum_types_for_values(value_sets):
     """
     Calculates the absolute minimum schema required for the values to be set.
 
@@ -392,61 +408,108 @@ def generate_column_definitions(col_info):
     Based on the given columns, generates a list of strings representing lines to be added
     to ALTER TABLE or CREATE TABLE.
 
-    :param col_info: tuple with 3 elements for name, type, and length
-    :type col_info: tuple
+    :param col_info: OrderedDict with column_name keys and values of dicts containing
+                     'type' and 'length'
+    :type col_info: OrderedDict
     :return: a list of column definitions
     :rtype: list of str
     """
-    NAME = 0
-    TYPE = 1
-    LENGTH = 2
-
     column_definitions = []
-    for col_info in col_info:
-        if col_info[TYPE] == 'varchar':
-            length = max(col_info[LENGTH], 255)
-            col_str = '{} {}({}) NULL'.format(col_info[NAME], col_info[TYPE],
-                      length)
+    for col_name, col_type_info in col_info.iteritems():
+        col_type = col_type_info['type']
+        col_length = col_type_info['length']
+        if col_type == 'varchar':
+            col_length = max(col_length, 255)
+            col_str = '{} {}({}) NULL'.format(col_name, col_type, col_length)
         else:
-            col_str = '{} {} NULL'.format(col_info[NAME], col_info[TYPE])
+            col_str = '{} {} NULL'.format(col_name, col_type)
         column_definitions.append(col_str)
 
     return column_definitions
 
 
-def generate_create_table(table_name, column_names, types, lengths):
-    col_strs = generate_column_definitions(zip(column_names, types, lengths))
+def generate_create_table(table_name, table_schema):
+    col_strs = generate_column_definitions(table_schema)
     return 'CREATE TABLE {} (\n{}\n)'.format(table_name, ',\n'.join(col_strs))
 
 
-def generate_alter_table(table_name, columns_to_add, columns_to_modify):
-    add_strs = generate_column_definitions(columns_to_add)
+def generate_alter_table(table_name, add_column_schema, modify_column_schema):
+    add_strs = generate_column_definitions(add_column_schema)
     add_strs = ['ADD COLUMN ' + add_line for add_line in add_strs]
-    modify_strs = generate_column_definitions(columns_to_modify)
+    modify_strs = generate_column_definitions(modify_column_schema)
     modify_strs = ['MODIFY COLUMN ' + line for line in modify_strs]
     lines = add_strs + modify_strs
     return 'ALTER TABLE {}\n{}'.format(table_name, ',\n'.join(lines))
 
 
-def calculate_flexibility(sql_type_name):
+def flexibility_score(column_info):
     """
     Converts the string of the type name to how flexible it is. When deciding whether to change
     the schema, higher flexibility always wins.
     """
-    flexibility = {
-        'int': 1,
-        'double': 2,
-        'varchar': 3
+    type_flexibility = {
+        'int': 100000,
+        'double': 200000,
+        'varchar': 300000
     }
-    return flexibility[sql_type_name]
+    return type_flexibility[column_info['type']] + column_info['length']
 
 
-def make_insert_table_name(table_name, table_group):
-    table_index = table_group[0][0]
+def generate_new_schema(existing_schema, query_schema):
+    """
+    Checks if the existing schema is sufficient for the query; if it is, return None.
+    Otherwise, return a schema for a CREATE new table statement, as well as one for just
+    ALTER statements.
+
+    :type existing_schema: dict
+    :type query_schema: dict
+    :return: three dicts, one with a schema for CREATE, one with a schema for columns to
+             be ADDed in an ALTER query, and finally one with a schema for columns to be
+             MODIFYed in an ALTER query
+    :rtype: (dict, dict, dict)
+    """
+    create_schema = OrderedDict()
+    add_schema = OrderedDict()
+    modify_schema = {}
+
+    for column_name, existing_column in existing_schema.iteritems():
+        if column_name not in query_schema:
+            create_schema[column_name] = existing_column
+            continue
+
+        query_column = query_schema[column_name]
+        if flexibility_score(query_column) > flexibility_score(existing_column):
+            create_schema[column_name] = query_column
+            modify_schema[column_name] = query_column
+        else:
+            create_schema[column_name] = existing_column
+
+    for column_name, query_column in query_schema.iteritems():
+        if column_name not in create_schema:
+            create_schema[column_name] = query_column
+            add_schema[column_name] = query_column
+
+    return create_schema, add_schema, modify_schema
+
+def make_real_table_name(table_name, table_index):
     if table_index >= 0:
-        return table_name + '__' + table_index
+        return '{}__{}'.format(table_name, table_index)
     else:
         return table_name
+
+def generate_triggers(old_table, new_table, shared_columns):
+    """
+    Creates a query to create triggers for new columns.
+    """
+    cols = ', '.join(shared_columns)
+    new_plus_cols = ['NEW.' + col for col in cols]
+
+    insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
+                     "FOR EACH ROW REPLACE INTO {dest_table} ({cols}) VALUES \n" \
+                     "({new_plus_cols})".format(source_table=new_table, dest_table=old_table,
+                                                cols=cols, new_plus_cols=new_plus_cols)
+
+    return insert_trigger
 
 
 conn = Connection(original_conn)
@@ -461,10 +524,10 @@ print_token_children(stmt)
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
 # conn.commit()
-# cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
-#             "(909876543,'Harry Yu', 'Saybrook', 12.34, '2014')")
-# conn.commit()
+cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
+            "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
+conn.commit()
 # cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
 #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
-# conn.commit()
+conn.commit()
 
