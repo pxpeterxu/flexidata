@@ -18,6 +18,7 @@ original_conn = pymysql.connect(
     passwd=settings.flexidata_password,
     host=settings.flexidata_host)
 
+
 class Connection(object):
     """
     Wraps around a DBAPI 2.0 Connection
@@ -96,7 +97,7 @@ class Cursor(object):
             new_table_version = old_table_version + 1
 
         # Check what we need to change
-        create_schema, add_schema, modify_schema =  generate_new_schema(
+        create_schema, add_schema, modify_schema = generate_new_schema(
             original_schema, query_schema)
 
         # If we need to change the schema
@@ -112,7 +113,7 @@ class Cursor(object):
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
-                                                       shared_columns)
+                                                       shared_columns, [])
                 self.cursor.execute(create_trigger_sql)
 
             self.conn._refresh_schemas()
@@ -140,7 +141,14 @@ class Cursor(object):
         return self._prepare_schema(table_name, query_minimum_schema)
 
     def _prepare_for_update(self, stmt):
-        pass
+        table_name, row_data, where_columns = update_find_data(stmt)
+        types, lengths = find_minimum_types_for_values([row_data.values()])
+
+        query_minimum_schema = OrderedDict()
+        for info in zip(row_data.keys(), types, lengths):
+            query_minimum_schema[info[0]] = {'type': info[1], 'length': info[2]}
+
+        return self._prepare_schema(table_name, query_minimum_schema)
 
     def _prepare_for_select(self, stmt):
         # Get basic information
@@ -155,8 +163,8 @@ class Cursor(object):
         #[ORDER BY {col_name | expr | position}
         #          [ASC | DESC], ...]
         select_columns = select_find_columns(stmt, table_name)
-        where_columns = select_find_columns(stmt, table_name)
-        having_columns = select_find_columns(stmt, table_name)
+        where_columns = find_columns_in_where(stmt, table_name)
+        having_columns = find_columns_in_having(stmt, table_name)
         order_by_columns = find_columns_in_orderby(stmt, table_name)
         group_by_columns = find_columns_in_groupby(stmt, table_name)
 
@@ -201,6 +209,7 @@ class Cursor(object):
                 insert_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
+                update_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
                 stmt = self._prepare_for_select(stmt)
 
@@ -236,6 +245,27 @@ class Cursor(object):
 
     def setoutputsize(self, size, column=None):
         self.cursor.setoutputsizes(size, column)
+
+
+def find_tokens_until_match(token, until_token_filter):
+    """
+    Find all the tokens starting from token and ending before a token that
+    matches one of the token_specs
+    :param token: token to start searching at
+    :type token: sqlparse.sql.Token
+    :param until_token_filter: conditions on the kind of token to stop at. The function
+                              should return True on match, False otherwise
+    :type until_token_filter: function
+    :return: all tokens (including 'token') before a token that matches until_token_specs
+    """
+    cur = token
+    while cur is not None:
+        if until_token_filter(cur):
+            break
+        cur = cur.token_next()
+
+    if cur is None:
+        return
 
 
 def find_tokens_by_instance(tokens, token_class, recursive=False):
@@ -317,6 +347,7 @@ def find_columns_in_condition(stmt, default_table):
             columns.add(separate_table_and_column(identifier, default_table))
 
     return columns
+
 
 def find_columns_in_where(stmt, default_table):
     """
@@ -490,7 +521,7 @@ def update_find_data(stmt):
         value = str(identifiers[1]).strip('"`\'')
         col_values[column] = value
 
-    where_columns = find_columns_in_where(stmt, table_name)
+    where_columns = find_columns_in_where(stmt)
 
     return table_name, col_values, where_columns
 
@@ -529,8 +560,8 @@ def select_find_table_name(stmt):
     :type stmt: sqlparse.sql.TokenList
     :return: the table name as a string
     """
-    from_clause = stmt.token_next_by_instance(0, psqle.From)
-    identifier = from_clause.token_next_by_instance(0, psql.Identifier)
+    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "FROM")) + 1
+    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
     name = identifier.token_next_by_type(0, ptokens.Name)
     return str(name).strip('"`')
 
@@ -543,7 +574,7 @@ def select_find_columns(stmt, default_table):
     :param default_table: the default table's name (for columns not in the form of table.column)
     :return: a list of [(table, column), ...] as strings. * is returned as (None, '*')
     """
-    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword.DML, "SELECT")) + 1
+    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "SELECT")) + 1
 
     # TODO(peterxu): This doesn't deal with SELECT (SELECT id...)
     identifierlist = stmt.token_next_by_instance(search_start_index, psql.IdentifierList)
@@ -555,9 +586,30 @@ def select_find_columns(stmt, default_table):
                             and stmt.token_index(identifier) < stmt.token_index(identifierlist)):
         identifiers = [identifier]
     else:
-        identifiers = find_tokens_by_instance(identifierlist.tokens, psql.Identifier)
+        identifiers = find_tokens_by_instance(identifierlist, psql.Identifier)
 
-    return set(separate_table_and_column(id, default_table) for id in identifiers)
+    # Possible schemes
+    # table.column AS alias: parsed as
+    #   table (Name)
+    #   column (Name)
+    #   AS (Keyword)
+    #   alias (Identifier)
+    #       alias (Name)
+    # In all cases, the last Name in the identifier is the column
+
+    columns = []
+    for id in identifiers:
+        name_tokens = find_tokens_by_type(id, ptokens.Name)
+        table = default_table if len(name_tokens) == 1 else name_tokens[0]
+        column = name_tokens[-1]
+
+        # For SELECT *; don't override SELECT table1.*
+        if column == '*' and len(name_tokens) == 1:
+            table = None
+
+        columns.append((str(table), str(column),))
+
+    return columns
 
 
 def extract_type_data(type_str):
@@ -806,9 +858,8 @@ stmt = psqle.parse("UPDATE `Customers` SET `ContactName`='Alfred Schmidt',`Conta
 stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
 print_token_children(stmt)
-stmt = psqle.parse("SELECT id, value FROM Test1 ORDER BY id DESC")[0]
+stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
 print_token_children(stmt)
-cur._prepare_for_select(stmt)
 
 # cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
@@ -816,7 +867,7 @@ cur._prepare_for_select(stmt)
 # cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
 #             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
 # conn.commit()
-# cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
+# cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
 #             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
 # conn.commit()
 
