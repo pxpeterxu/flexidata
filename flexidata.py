@@ -80,12 +80,12 @@ class Cursor(object):
         # Finds existing table schema
         if table_name not in schemas:
             original_schema = {}
-            old_table_index = None
-            new_table_index = -1
+            old_table_version = None
+            new_table_version = -1
         else:
             original_schema = schemas[table_name][0][1]
-            old_table_index = schemas[table_name][0][0]
-            new_table_index = old_table_index + 1
+            old_table_version = schemas[table_name][0][0]
+            new_table_version = old_table_version + 1
 
         # Check what we need to change
         create_schema, add_schema, modify_schema = generate_new_schema(
@@ -94,11 +94,19 @@ class Cursor(object):
         # If we need to change the schema
         if add_schema or modify_schema:
             # TODO(hsource) Currently all and any schema changes result in a new table; wasteful
-            real_table_name = make_real_table_name(table_name, new_table_index)
+            real_table_name = make_real_table_name(table_name, new_table_version)
             create_table_sql = generate_create_table(real_table_name, create_schema)
             self.cursor.execute(create_table_sql)
-            if old_table_index is not None:
-                create_trigger_sql = generate_triggers(old_table, new_table, shared_columns)
+
+            # Triggers
+            if old_table_version is not None:
+                old_table_name = make_real_table_name(table_name, old_table_version)
+                shared_columns = [column for column in create_schema
+                                  if column not in add_schema and column not in modify_schema]
+                create_trigger_sql = generate_triggers(old_table_name, real_table_name,
+                                                       shared_columns)
+                self.cursor.execute(create_trigger_sql)
+
             self.conn._refresh_schemas()
         else:
             real_table_name = make_real_table_name(table_name, schemas[table_name][0][0])
