@@ -51,6 +51,9 @@ class Connection(object):
     def cursor(self):
         return Cursor(self.conn.cursor(), self)
 
+    def escape(self, obj):
+        self.conn.escape(obj)
+
     def _refresh_schemas(self):
         self.schemas, self.num_rows = retrieve_schemas(self.conn)
         self.schemas = group_schemas(self.schemas, self.num_rows)
@@ -153,14 +156,17 @@ class Cursor(object):
         return self._prepare_schema(table_name, query_minimum_schema)
 
     def _insert_data_for_update(self, stmt, real_table_name):
-        _, _, where_token = update_find_tokens(stmt)
+        """
+        Propagates data matching the UPDATE conditions from the older tables to the newer
+        one.
+        """
+        where_token = stmt.token_next_by_instance(0, psql.Where)
         table_name, _, _ = update_find_data(stmt)
 
-        sql = generate_propagate_sql(real_table_name, table_name, conn.schemas, 'sid', where_token)
-
-
-
-
+        propagate_sql = generate_propagate_sql(real_table_name, table_name, conn.schemas, 'sid', where_token)
+        self.cursor.execute('SET @disable_triggers = 1;')
+        self.cursor.execute(propagate_sql)
+        self.cursor.execute('SET @disable_triggers = NULL;')
 
     def _prepare_for_select(self, stmt):
         # Get basic information
@@ -212,6 +218,8 @@ class Cursor(object):
         return stmt
 
     def execute(self, query, args=None):
+        if args is not None:
+            query = query % self.conn.escape(args)
         stmts = psqle.parse(query)
 
         for stmt in stmts:
@@ -220,7 +228,9 @@ class Cursor(object):
                 insert_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
+                self._insert_data_for_update(stmt, real_table_name)
                 update_replace_table_name(stmt, real_table_name)
+
             if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
                 # Use advanced query parser
                 print_token_children(stmt)
@@ -228,7 +238,7 @@ class Cursor(object):
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
-        return self.cursor.execute(query, args)
+        return self.cursor.execute(query)
 
     def executemany(self, query, args):
         return self.cursor.executemany(query, args)
@@ -920,7 +930,7 @@ def generate_triggers(old_table, new_table, shared_columns):
 
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
                      "FOR EACH ROW BEGIN \n" \
-                     "  IF (@DISABLE_TRIGGERS IS NULL) THEN \n" \
+                     "  IF (@disable_triggers IS NULL) THEN \n" \
                      "      INSERT INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
                      "  END IF; \n" \
                      "END;".format(source_table=new_table, dest_table=old_table,
@@ -940,9 +950,12 @@ def generate_propagate_arguments_for_table(table_name, table_schemas):
     last_table_columns = {}
     copy_columns = defaultdict(list)
 
-    for table_info in reversed(table_schemas):
+    first_table_version = None
+    for table_info in reversed(table_schemas[table_name]):
         table_version = table_info[0]
         columns = table_info[1]
+        first_table_version = table_version if first_table_version is None else first_table_version
+
         real_table_name = make_real_table_name(table_name, table_version)
 
         for column_name, type_info in columns.iteritems():
@@ -959,7 +972,7 @@ def generate_propagate_arguments_for_table(table_name, table_schemas):
 
         last_table_columns = columns
 
-    first_table = make_real_table_name(table_name, table_schemas[-1][0])
+    first_table = make_real_table_name(table_name, first_table_version)
     join_tables = set(itertools.chain.from_iterable(copy_columns.itervalues()))
     join_tables.remove(first_table)
 
@@ -993,17 +1006,16 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
                         for join_table in join_tables]
     left_outer_joins = '\n'.join(left_outer_joins)
 
-    # TODO for testing only
-    copy_columns['college'].append('test_table__0')
-    replace_where_identifiers(where, {table_name: copy_columns})
+    new_where = copy.deepcopy(where)
+    replace_where_identifiers(new_where, {table_name: copy_columns})
 
-    # TODO(hsource) need to modify where so that it's a where object, and replace primary key refs
     full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
-        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where)
+        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=new_where)
 
     insert_columns = ', '.join(copy_columns.keys())
     insert_query = 'INSERT IGNORE INTO {insert_table_name} ({insert_columns}) {select}'.format(
-        insert_table_name=latest_version_table_name, insert_columns=insert_columns, select=full_select)
+        insert_table_name=latest_version_table_name, insert_columns=insert_columns,
+        select=full_select)
 
     return insert_query
 
@@ -1137,13 +1149,12 @@ stmt = psqle.parse("UPDATE test_table SET cash=394 WHERE (name='George Bush') AN
 #                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
 #print_token_children(stmt)
 #stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
-print_token_children(stmt)
-where = stmt.token_next_by_instance(0, psql.Where)
-print generate_propagate_sql('test_table__0', 'test_table', conn.schemas['test_table'], 'sid', where)
 
-# cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
-#             "(10210101, 'George Bush', 'Davenport', 9999999.54)")
-# conn.commit()
+cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
+            "(10210101, 'George Bush', 'Davenport', 9999999.54)")
+conn.commit()
+cur.execute("UPDATE test_table SET cash = 'none' WHERE name = 'George Bush'")
+conn.commit()
 # cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
 #             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
 # conn.commit()
