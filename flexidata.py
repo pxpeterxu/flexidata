@@ -930,6 +930,9 @@ def generate_triggers(old_table, new_table, shared_columns):
 def generate_propagate_arguments_for_table(table_name, table_schemas):
     """
     Generates the parameters necessary for forward propagating a table into the delta tables.
+    :param table_name: name of the (user-facing) table
+    :param table_schemas: the schema of the current user-facing table, in the form of
+                          schema = (version, [('column name' => column info)...)
     :return: first_table_name (the left-most table that isn't joined on),
              a dictionary matching column names to a list of tables that have it: note that
                 the list contains the oldest table versions first
@@ -970,7 +973,15 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
                            where):
     """
     Generates a SELECT for the INSERT INTO... SELECT queries.
-    :return: string of SELECT sql
+    :param latest_version_table_name: name of the latest version into which we're inserting
+    :param table_name: user-facing table name
+    :param table_schemas: the schema of the current table, in the form of
+                          schema = (version, [('column name' => column info)...)
+    :param primary_key: column of the primary key of the table
+    :type primary_key: str
+    :param where: the parsed group containing the WHERE conditions
+    :type where: sqlparse.sql.Where
+    :return: string of INSERT INTO ... SELECT sql
     :rtype: str
     """
     first_table, copy_columns, join_tables = generate_propagate_arguments_for_table(
