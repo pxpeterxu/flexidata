@@ -11,6 +11,7 @@ import re
 import itertools
 
 from collections import defaultdict, OrderedDict
+import copy
 import settings
 
 original_conn = pymysql.connect(
@@ -151,10 +152,11 @@ class Cursor(object):
 
         return self._prepare_schema(table_name, query_minimum_schema)
 
-    def _insert_data_for_update(self, stmt):
+    def _insert_data_for_update(self, stmt, real_table_name):
         _, _, where_token = update_find_tokens(stmt)
         table_name, _, _ = update_find_data(stmt)
 
+        sql = generate_propagate_sql(real_table_name, table_name, conn.schemas, 'sid', where_token)
 
 
 
@@ -426,7 +428,7 @@ def find_columns_in_orderby_groupby(stmt, default_table):
 def find_identifiers_with_name_sub_token(tokens):
     """
     Find all column/table-name identifiers in the list of tokens given.
-    :type tokens: list of str
+    :type tokens: list of Token
     :rtype: list of Identifier
     """
     found_identifiers = []
@@ -438,6 +440,22 @@ def find_identifiers_with_name_sub_token(tokens):
             found_identifiers.extend(find_identifiers_with_name_sub_token(token.tokens))
     return found_identifiers
 
+
+def find_comparison_with_identifier(token, identifier):
+    """
+    Recursively looks for a Comparison object that contains the specified identifier inside.
+    """
+    for sub_token in token.tokens:
+        if isinstance(sub_token, psql.Comparison):
+            identifiers = find_tokens_by_instance(sub_token.tokens, psql.Identifier, True)
+            if identifier in identifiers:
+                return sub_token, token
+        elif isinstance(sub_token, psql.TokenList):
+            sub_return = find_comparison_with_identifier(sub_token, identifier)
+            if sub_return is not None:
+                return sub_token, token
+
+    return None
 
 
 def find_columns_in_where(stmt):
@@ -948,7 +966,7 @@ def generate_propagate_arguments_for_table(table_name, table_schemas):
     return first_table, copy_columns, join_tables
 
 
-def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary_key,
+def generate_propagate_sql(latest_version_table_name, table_name, table_schemas, primary_key,
                            where):
     """
     Generates a SELECT for the INSERT INTO... SELECT queries.
@@ -975,7 +993,9 @@ def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary
                         for join_table in join_tables]
     left_outer_joins = '\n'.join(left_outer_joins)
 
-    replace_identifiers(where.tokens, {table_name: copy_columns})
+    # TODO for testing only
+    copy_columns['college'].append('test_table__0')
+    replace_where_identifiers(where, {table_name: copy_columns})
 
     # TODO(hsource) need to modify where so that it's a where object, and replace primary key refs
     full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
@@ -983,7 +1003,7 @@ def generate_propagate_sql(insert_table_name, table_name, table_schemas, primary
 
     insert_columns = ', '.join(copy_columns.keys())
     insert_query = 'INSERT IGNORE INTO {insert_table_name} ({insert_columns}) {select}'.format(
-        insert_table_name=insert_table_name, insert_columns=insert_columns, select=full_select)
+        insert_table_name=latest_version_table_name, insert_columns=insert_columns, select=full_select)
 
     return insert_query
 
@@ -1010,9 +1030,71 @@ def infer_table(column, tables_columns):
 
     return table_found
 
-def replace_identifiers(tokens, tables_columns):
+def convert_comparison_for_multi_table(comparison_token, parent_token, column, tables):
+    comparison_token_index = parent_token.token_index(comparison_token)
+    parenthesis = psql.Parenthesis()
+    parent_token.tokens[comparison_token_index] = parenthesis
+
+    parenthesis.tokens.append(psql.Token(ptokens.Punctuation, '('))
+
+    tables_to_check_for_null = []
+
+    for table in reversed(tables):
+        sub_parenthesis = psql.Parenthesis()
+        sub_parenthesis.tokens.append(psql.Token(ptokens.Punctuation, '('))
+
+        new_comparison_token = copy.copy(comparison_token)
+        identifier = new_comparison_token.token_next_by_instance(0, psql.Identifier)
+        identifier_index = new_comparison_token.token_index(identifier)
+        new_comparison_token.tokens[identifier_index] = psql.Identifier([
+            psql.Token(ptokens.Name, table),
+            psql.Token(ptokens.Punctuation, '.'),
+            psql.Token(ptokens.Name, column)
+        ])
+        identifier = new_comparison_token.tokens[identifier_index]
+        sub_parenthesis.tokens.append(new_comparison_token)
+
+        for null_column_table in tables_to_check_for_null:
+            identifier = psql.Identifier([
+                psql.Token(ptokens.Name, null_column_table),
+                psql.Token(ptokens.Punctuation, '.'),
+                psql.Token(ptokens.Name, column)
+            ])
+
+            null_comparison = psql.Comparison([
+                identifier,
+                psql.Token(ptokens.Whitespace, ' '),
+                psql.Token(ptokens.Keyword, 'IS'),
+                psql.Token(ptokens.Whitespace, ' '),
+                psql.Token(ptokens.Keyword, 'NULL')
+            ])
+
+            sub_parenthesis.tokens.extend([
+                psql.Token(ptokens.Whitespace, ' '),
+                psql.Token(ptokens.Keyword, 'AND'),
+                psql.Token(ptokens.Whitespace, ' '),
+                null_comparison
+            ])
+
+        sub_parenthesis.tokens.append(psql.Token(ptokens.Punctuation, ')'))
+
+        tables_to_check_for_null.append(table)
+
+        if len(parenthesis.tokens) > 1:  # We have more than the starting parenthesis
+            parenthesis.tokens.extend([
+                psql.Token(ptokens.Whitespace, ' '),
+                psql.Token(ptokens.Keyword, 'OR'),
+                psql.Token(ptokens.Whitespace, ' '),
+            ])
+        parenthesis.tokens.append(sub_parenthesis)
+
+    parenthesis.tokens.append(psql.Token(ptokens.Punctuation, ')'))
+
+
+def replace_where_identifiers(where_token, tables_columns):
     """
-    Replaces the identifiers in the tokens list.
+    Replaces the identifiers in the tokens list. Note that while this only works for WHERE
+    clauses right now, it's very easily adaptable. The only WHERE-specific code is right after
 
     :param tokens:
     :type tokens:
@@ -1021,7 +1103,7 @@ def replace_identifiers(tokens, tables_columns):
     :rtype:
     """
 
-    identifiers = find_identifiers_with_name_sub_token(tokens)
+    identifiers = find_identifiers_with_name_sub_token(where_token.tokens)
     for identifier in identifiers:
         table, column = separate_table_and_column(identifier, None)
         if table is None:
@@ -1032,23 +1114,24 @@ def replace_identifiers(tokens, tables_columns):
         real_table_candidates = tables_columns[table][column]
         if len(real_table_candidates) == 1:
             real_table = real_table_candidates[0]
+
+            identifier.tokens = [
+                psql.Token(ptokens.Name, real_table),
+                psql.Token(ptokens.Punctuation, '.'),
+                psql.Token(ptokens.Name, column)
+            ]
         else:
-            # TODO(hsource) Make it split it up into OR statements if there's multiple tables
-            real_table = real_table_candidates[0]
-        identifier.tokens = [
-            psql.Token(ptokens.Name, real_table),
-            psql.Token(ptokens.Punctuation, '.'),
-            psql.Token(ptokens.Name, column)
-        ]
-
-
-
+            # TODO: note this doesn't deal with IS NULL or IS NOT NULL comparators
+            comparison_token, parent_token = find_comparison_with_identifier(where_token,
+                                                                             identifier)
+            convert_comparison_for_multi_table(comparison_token, parent_token, column,
+                                               real_table_candidates)
 
 
 conn = Connection(original_conn)
 cur = conn.cursor()
 
-stmt = psqle.parse("UPDATE test_table SET cash=394 WHERE name='George Bush'")[0]
+stmt = psqle.parse("UPDATE test_table SET cash=394 WHERE (name='George Bush') AND college='Davenport'")[0]
 # #insert_replace_table_name(stmt, 'blah_table')
 # stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
 #                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
