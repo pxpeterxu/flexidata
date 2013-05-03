@@ -43,10 +43,17 @@ def group_list(tlist, starting_keyword, instance):
      if not isinstance(sgroup, instance)]
     idx = 0
     token = tlist.token_next_match(idx, ptokens.Keyword, starting_keyword)
-    stopwords = ('WHERE', 'ORDER', 'GROUP', 'LIMIT', 'UNION', 'HAVING')
+    stopwords = ['FROM', 'WHERE', 'ORDER', 'GROUP', 'LIMIT', 'UNION', 'HAVING']
     while token:
         tidx = tlist.token_index(token)
         end = tlist.token_next_match(tidx + 1, ptokens.Keyword, stopwords)
+        end2 = tlist.token_next_by_instance(tidx + 1, psql.Where)
+
+        index = 99999 if end is None else tlist.token_index(end)
+        index2 = 99999 if end2 is None else tlist.token_index(end2)
+        first = min(index, index2)
+        end = tlist.tokens[first] if first != 99999 else None
+
         if end is None:
             end = tlist._groupable_tokens[-1]
         else:
