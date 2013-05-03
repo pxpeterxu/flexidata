@@ -52,6 +52,9 @@ class Connection(object):
     def cursor(self):
         return Cursor(self.conn.cursor(), self)
 
+    def escape(self, obj):
+        self.conn.escape(obj)
+
     def _refresh_schemas(self):
         print 'refreshing'
         self.schemas, self.num_rows = retrieve_schemas(self.conn)
@@ -156,14 +159,17 @@ class Cursor(object):
         return self._prepare_schema(table_name, query_minimum_schema)
 
     def _insert_data_for_update(self, stmt, real_table_name):
-        _, _, where_token = update_find_tokens(stmt)
+        """
+        Propagates data matching the UPDATE conditions from the older tables to the newer
+        one.
+        """
+        where_token = stmt.token_next_by_instance(0, psql.Where)
         table_name, _, _ = update_find_data(stmt)
 
-        sql = generate_propagate_sql(real_table_name, table_name, self.conn.schemas, 'sid', where_token)
-
-
-
-
+        propagate_sql = generate_propagate_sql(real_table_name, table_name, self.conn.schemas[real_table_name], 'sid', where_token)
+        self.cursor.execute('SET @disable_triggers = 1;')
+        self.cursor.execute(propagate_sql)
+        self.cursor.execute('SET @disable_triggers = NULL;')
 
     def _prepare_for_select(self, stmt):
         # Get basic information
@@ -200,7 +206,7 @@ class Cursor(object):
         order_by = stmt.token_next_by_instance(0, psqle.OrderBy)
         where = stmt.token_next_by_instance(0, psql.Where)
         having = stmt.token_next_by_instance(0, psqle.Having)
-        print_token_children(stmt)
+
         table_strings = []
         for table in tables:
             schema = schemas[table]
@@ -224,13 +230,12 @@ class Cursor(object):
             if where is not None:
                 replace_where_identifiers(where, {table: column_versions})
 
-        print table_strings
-
-
         from_token.tokens = psqle.parse('FROM ' + ', '.join(table_strings))
         return stmt
 
     def execute(self, query, args=None):
+        if args is not None:
+            query = query % self.conn.escape(args)
         stmts = psqle.parse(query)
 
         for stmt in stmts:
@@ -239,15 +244,16 @@ class Cursor(object):
                 insert_replace_table_name(stmt, real_table_name)
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
+                self._insert_data_for_update(stmt, real_table_name)
                 update_replace_table_name(stmt, real_table_name)
+
             if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
                 # Use advanced query parser
                 self._prepare_for_select(stmt)
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
-        print query
-        return self.cursor.execute(query, args)
+        return self.cursor.execute(query)
 
     def executemany(self, query, args):
         return self.cursor.executemany(query, args)
@@ -457,7 +463,6 @@ def find_identifiers_with_name_sub_token(tokens):
             found_identifiers.append(token)
         elif isinstance(token, psql.TokenList):
             found_identifiers.extend(find_identifiers_with_name_sub_token(token.tokens))
-    print found_identifiers
     return found_identifiers
 
 
@@ -465,9 +470,6 @@ def find_comparison_with_identifier(token, identifier):
     """
     Recursively looks for a Comparison object that contains the specified identifier inside.
     """
-    print 'find_comparison_with_identifier'
-    print_token_children(token)
-    print identifier
     for sub_token in token.tokens:
         if isinstance(sub_token, psql.Comparison):
             identifiers = find_tokens_by_instance(sub_token.tokens, psql.Identifier, True)
@@ -951,7 +953,7 @@ def generate_triggers(old_table, new_table, shared_columns):
 
     insert_trigger = "CREATE TRIGGER {source_table}_insert AFTER INSERT ON {source_table} \n" \
                      "FOR EACH ROW BEGIN \n" \
-                     "  IF (@DISABLE_TRIGGERS IS NULL) THEN \n" \
+                     "  IF (@disable_triggers IS NULL) THEN \n" \
                      "      INSERT INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
                      "  END IF; \n" \
                      "END;".format(source_table=new_table, dest_table=old_table,
@@ -963,7 +965,7 @@ def generate_select_arguments(table_name, table_schemas, columns_present=None):
     Generates the parameters necessary for forward propagating a table into the delta tables.
     :param table_name: name of the (user-facing) table
     :param table_schemas: the schema of the current user-facing table, in the form of
-                          schema = (version, [('column name' => column info)...)
+                          schema = [(version, [('column name' => column info)...)
     :param columns_present: limit the columns examined to only these columns, in the form of
                             (table_name, column_name) tuples. Set to None for all columns
     :type columns_present: (str, str)
@@ -978,10 +980,12 @@ def generate_select_arguments(table_name, table_schemas, columns_present=None):
     # Stores the table columns that are covered by tables used so far
     column_versions = defaultdict(list)
 
-    # Goes through versions from oldest to newest
+    first_table_version = None
     for table_info in reversed(table_schemas):
         table_version = table_info[0]
         columns = table_info[1]
+        first_table_version = table_version if first_table_version is None else first_table_version
+
         real_table_name = make_real_table_name(table_name, table_version)
 
         # Figure out which versions need to be included for queries involving each
@@ -1002,7 +1006,7 @@ def generate_select_arguments(table_name, table_schemas, columns_present=None):
 
         last_table_columns = columns
 
-    first_table = make_real_table_name(table_name, table_schemas[-1][0])
+    first_table = make_real_table_name(table_name, first_table_version)
     join_tables = set(itertools.chain.from_iterable(column_versions.itervalues()))
     join_tables.remove(first_table)
 
@@ -1063,17 +1067,16 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
 
     left_outer_joins = make_join_string(first_table, join_tables, primary_key)
 
-    # TODO for testing only
-    copy_columns['college'].append('test_table__0')
-    replace_where_identifiers(where, {table_name: copy_columns})
+    new_where = copy.deepcopy(where)
+    replace_where_identifiers(new_where, {table_name: copy_columns})
 
-    # TODO(hsource) need to modify where so that it's a where object, and replace primary key refs
     full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
-        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=where)
+        selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=new_where)
 
     insert_columns = ', '.join(copy_columns.keys())
     insert_query = 'INSERT IGNORE INTO {insert_table_name} ({insert_columns}) {select}'.format(
-        insert_table_name=latest_version_table_name, insert_columns=insert_columns, select=full_select)
+        insert_table_name=latest_version_table_name, insert_columns=insert_columns,
+        select=full_select)
 
     return insert_query
 
@@ -1209,7 +1212,6 @@ def replace_where_identifiers(where_token, column_versions):
     identifiers = find_identifiers_with_name_sub_token(where_token.tokens)
 
     for identifier in identifiers:
-        print identifier
         table, column = separate_table_and_column(identifier, None)
         if table is None:
             table = infer_table(column, column_versions)
@@ -1251,4 +1253,4 @@ def replace_where_identifiers(where_token, column_versions):
 
             comparison_token, parent_token = output
             convert_comparison_for_multi_table(comparison_token, parent_token, column,
-                                               real_table_candidates)
+                real_table_candidates)
