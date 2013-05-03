@@ -55,10 +55,20 @@ class Connection(object):
         self.conn.escape(obj)
 
     def _refresh_schemas(self):
-        self.schemas, self.num_rows = retrieve_schemas(self.conn)
+        self.schemas, self.num_rows, primary_keys = retrieve_schemas(self.conn)
+        self.primary_keys = {}
+        for table_name, key in primary_keys.iteritems():
+            if '__' in table_name:
+                base_table_name = table_name[:table_name.find('__')]
+                if not base_table_name in self.primary_keys:
+                    self.primary_keys[base_table_name] = key
+
         self.schemas = group_schemas(self.schemas, self.num_rows)
         # self.schemas is in the form of
         # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
+
+
+
 
 
 class Cursor(object):
@@ -738,18 +748,23 @@ def retrieve_schemas(conn):
     cur = conn.cursor(pymysql.cursors.DictCursor)
 
     tables_info = {}
+    primary_keys = {}
+
     for table in tables:
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
         tables_info[table] = OrderedDict()
         for col_info in cur.fetchall():
-            tables_info[table][col_info[u'Field']] = extract_type_data(col_info[u'Type'])
+            column_name = col_info[u'Field']
+            tables_info[table][column_name] = extract_type_data(col_info[u'Type'])
+            if 'PRI' in col_info[u'Key']:
+                primary_keys[table] = column_name
 
     cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
                 "'{}'".format(conn.db))
     tables_num_rows = {col_info[u'TABLE_NAME']: int(col_info['TABLE_ROWS'])
                        for col_info in cur.fetchall()}
 
-    return tables_info, tables_num_rows
+    return tables_info, tables_num_rows, primary_keys
 
 
 def group_schemas(tables_info, tables_num_rows):
