@@ -1,6 +1,7 @@
 __author__ = 'User'
 
 import sqlparse
+
 from sqlparse import sql as psql
 from sqlparse import tokens as ptokens
 
@@ -55,6 +56,7 @@ class Connection(object):
         self.conn.escape(obj)
 
     def _refresh_schemas(self):
+        print 'refreshing'
         self.schemas, self.num_rows, primary_keys = retrieve_schemas(self.conn)
         self.primary_keys = {}
         for table_name, key in primary_keys.iteritems():
@@ -64,11 +66,9 @@ class Connection(object):
                     self.primary_keys[base_table_name] = key
 
         self.schemas = group_schemas(self.schemas, self.num_rows)
+        print 'refreshed'
         # self.schemas is in the form of
         # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
-
-
-
 
 
 class Cursor(object):
@@ -173,14 +173,18 @@ class Cursor(object):
         where_token = stmt.token_next_by_instance(0, psql.Where)
         table_name, _, _ = update_find_data(stmt)
 
-        propagate_sql = generate_propagate_sql(real_table_name, table_name, conn.schemas, 'sid', where_token)
+        propagate_sql = generate_propagate_sql(real_table_name, table_name, self.conn.schemas[real_table_name], 'sid', where_token)
         self.cursor.execute('SET @disable_triggers = 1;')
         self.cursor.execute(propagate_sql)
         self.cursor.execute('SET @disable_triggers = NULL;')
 
     def _prepare_for_select(self, stmt):
         # Get basic information
-        table_name = select_find_table_name(stmt)
+        tables = select_find_tables(stmt)
+        if len(tables) == 1:
+            (default_table,) = tables
+        else:
+            default_table = None
 
         # Get columns in JOIN conditions
         #[FROM table_references
@@ -190,41 +194,50 @@ class Cursor(object):
         #[HAVING where_condition]
         #[ORDER BY {col_name | expr | position}
         #          [ASC | DESC], ...]
-        select_columns = select_find_columns(stmt, table_name)
-        where_columns = find_columns_in_where(stmt, table_name)
-        having_columns = find_columns_in_having(stmt, table_name)
-        order_by_columns = find_columns_in_orderby(stmt, table_name)
-        group_by_columns = find_columns_in_groupby(stmt, table_name)
+        select_columns = select_find_columns(stmt, default_table)
+        where_columns = find_columns_in_where(stmt, default_table)
+        having_columns = find_columns_in_having(stmt, default_table)
+        order_by_columns = find_columns_in_orderby(stmt, default_table)
+        group_by_columns = find_columns_in_groupby(stmt, default_table)
 
         columns = select_columns | where_columns | having_columns | order_by_columns | group_by_columns
-        tables = set(table for table, column in columns)
-        table = table_name
 
+        # Get tables we used
+        used_tables = set(table for table, column in columns) | tables
         schemas = self.conn.schemas
 
-        #if table not in schemas:
-            #return stmt
-
-        # Identify the latest version of each table listed that we need
-        # TODO(peterxu): the above. Right now, we just join all possible versions
-        # TODO(peterxu): allow for joins with multiple tables
-
+        # Get the identifiers in SELECT [] FROM ... to be replaced
         from_token = stmt.token_next_by_instance(0, psqle.From)
+        column_tokens = stmt.tokens_between(stmt.tokens[0], from_token, exclude_end=True)
+        group_by = stmt.token_next_by_instance(0, psqle.GroupBy)
+        order_by = stmt.token_next_by_instance(0, psqle.OrderBy)
+        where = stmt.token_next_by_instance(0, psql.Where)
+        having = stmt.token_next_by_instance(0, psqle.Having)
 
-        earliest = None
-        for schema in reversed(schemas[table]):
-            if earliest is None:
-                earliest = schema
-                version, column_info, num_rows = earliest
-                primary_key = column_info.keys()[0]
-                join_strings = make_real_table_name(table, version)
+        table_strings = []
+        for table in tables:
+            schema = schemas[table]
+            column_info = schema[0][1]
+            if (None, '*') in columns or (table, '*') in columns:
+                columns_to_get = None # Get all columns
+            else:
+                columns_to_get = columns
 
-                continue
 
-            version = schema[0]
-            join_strings += ' LEFT OUTER JOIN {0} USING {1}'.format(make_real_table_name(table, version))
+            first_table, column_versions, join_tables = generate_select_arguments(
+                table, schema, columns_to_get)
+            table_strings.append(make_join_string(first_table, join_tables, column_info.keys()[0]))
+            replace_identifiers(column_tokens, {table: column_versions})
+            if group_by is not None:
+                replace_identifiers(group_by.tokens, {table: column_versions})
+            if order_by is not None:
+                replace_identifiers(order_by.tokens, {table: column_versions})
+            if having is not None:
+                replace_where_identifiers(having, {table: column_versions})
+            if where is not None:
+                replace_where_identifiers(where, {table: column_versions})
 
-        from_token.tokens = psqle.parse(join_strings)
+        from_token.tokens = psqle.parse('FROM ' + ', '.join(table_strings))
         return stmt
 
     def execute(self, query, args=None):
@@ -243,7 +256,6 @@ class Cursor(object):
 
             if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
                 # Use advanced query parser
-                print_token_children(stmt)
                 self._prepare_for_select(stmt)
 
         stmts = [str(stmt) for stmt in stmts]
@@ -478,7 +490,7 @@ def find_comparison_with_identifier(token, identifier):
     return None
 
 
-def find_columns_in_where(stmt):
+def find_columns_in_where_old(stmt):
     """
     Finds all column names in a statement (for seeing if schema change is necessary).
 
@@ -614,7 +626,7 @@ def update_find_data(stmt):
         value = str(identifiers[1]).strip('"`\'')
         col_values[column] = value
 
-    where_columns = find_columns_in_where(stmt)
+    where_columns = find_columns_in_where_old(stmt)
 
     return table_name, col_values, where_columns
 
@@ -659,17 +671,23 @@ def update_replace_table_name(stmt, table_name):
     table_name_token.value = table_name
 
 
-def select_find_table_name(stmt):
+def select_find_tables(stmt):
     """
     Find the table name of a SELECT query with only a single table
     :param stmt: parsed statement tree from sqlparse
     :type stmt: sqlparse.sql.TokenList
     :return: the table name as a string
     """
-    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "FROM")) + 1
-    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
-    name = identifier.token_next_by_type(0, ptokens.Name)
-    return str(name).strip('"`')
+    from_token = stmt.token_next_by_instance(0, psqle.From)
+    identifiers = find_tokens_by_instance(from_token.tokens, psql.Identifier)
+
+    tables = set()
+    for identifier in identifiers:
+        # Note: we only accept single-database queries, so
+        # SELECT * FROM yaleplus.Students, oci.Courses... does not work
+        name = identifier.token_next_by_type(0, ptokens.Name)
+        tables.add(str(name).strip('"`'))
+    return tables
 
 
 def select_find_columns(stmt, default_table):
@@ -680,19 +698,17 @@ def select_find_columns(stmt, default_table):
     :param default_table: the default table's name (for columns not in the form of table.column)
     :return: a list of [(table, column), ...] as strings. * is returned as (None, '*')
     """
-    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.Keyword, "SELECT")) + 1
+    search_start_index = stmt.token_index(stmt.token_next_match(0, ptokens.DML, 'SELECT')) + 1
 
     # TODO(peterxu): This doesn't deal with SELECT (SELECT id...)
-    identifierlist = stmt.token_next_by_instance(search_start_index, psql.IdentifierList)
-    identifier = stmt.token_next_by_instance(search_start_index, psql.Identifier)
+    next_token = stmt.token_next(search_start_index)
 
-    # If there's no identifierlist, or if the identifier comes before the identifierllist,
-    # we have a SELECT single_column FROM table
-    if identifierlist is None or (identifier is not None
-                            and stmt.token_index(identifier) < stmt.token_index(identifierlist)):
-        identifiers = [identifier]
-    else:
-        identifiers = find_tokens_by_instance(identifierlist, psql.Identifier)
+    # Could either be multiple identifiers, SELECT *, ..., or SELECT id FROM
+    if isinstance(next_token, psql.IdentifierList):
+        identifiers = find_tokens_by_instance(next_token.tokens, psql.Identifier) +\
+                      find_tokens_by_type(next_token.tokens, ptokens.Wildcard)
+    else: # isinstance(next_token, psql.Identifier) or next_token.ttype == ptokens.Wildcard:
+        identifiers = [next_token]
 
     # Possible schemes
     # table.column AS alias: parsed as
@@ -703,9 +719,13 @@ def select_find_columns(stmt, default_table):
     #       alias (Name)
     # In all cases, the last Name in the identifier is the column
 
-    columns = []
+    columns = set()
     for id in identifiers:
-        name_tokens = find_tokens_by_type(id, ptokens.Name)
+        if id.ttype == ptokens.Wildcard:
+            columns.add((None, '*'))
+            continue
+
+        name_tokens = find_tokens_by_type(id.tokens, ptokens.Name)
         table = default_table if len(name_tokens) == 1 else name_tokens[0]
         column = name_tokens[-1]
 
@@ -713,7 +733,7 @@ def select_find_columns(stmt, default_table):
         if column == '*' and len(name_tokens) == 1:
             table = None
 
-        columns.append((str(table), str(column),))
+        columns.add((str(table), str(column),))
 
     return columns
 
@@ -952,56 +972,98 @@ def generate_triggers(old_table, new_table, shared_columns):
                                    cols=cols, new_plus_cols=cols_new)
     return insert_trigger
 
-def generate_propagate_arguments_for_table(table_name, table_schemas):
+def generate_select_arguments(table_name, table_schemas, columns_present=None):
     """
     Generates the parameters necessary for forward propagating a table into the delta tables.
+    :param table_name: name of the (user-facing) table
+    :param table_schemas: the schema of the current user-facing table, in the form of
+                          schema = [(version, [('column name' => column info)...)
+    :param columns_present: limit the columns examined to only these columns, in the form of
+                            (table_name, column_name) tuples. Set to None for all columns
+    :type columns_present: (str, str)
     :return: first_table_name (the left-most table that isn't joined on),
              a dictionary matching column names to a list of tables that have it: note that
-                the list contains the oldest table versions first
+             the list contains the oldest table versions first
              join_tables (the set of tables to left join on)
     :rtype: (str, defaultdict of list, set of str)
     """
 
     last_table_columns = {}
-    copy_columns = defaultdict(list)
+    # Stores the table columns that are covered by tables used so far
+    column_versions = defaultdict(list)
 
     first_table_version = None
-    for table_info in reversed(table_schemas[table_name]):
+    for table_info in reversed(table_schemas):
         table_version = table_info[0]
         columns = table_info[1]
         first_table_version = table_version if first_table_version is None else first_table_version
 
         real_table_name = make_real_table_name(table_name, table_version)
 
+        # Figure out which versions need to be included for queries involving each
+        # column
         for column_name, type_info in columns.iteritems():
-            # This column was created in this table-version
-            if column_name not in last_table_columns:
-                copy_columns[column_name].append(real_table_name)
+            # Only examine relevant columns
+            if columns_present is None or (table_name, column_name,) in columns_present:
+                # This column was created in this table-version
+                if column_name not in last_table_columns:
+                    column_versions[column_name].append(real_table_name)
 
-            # This column was modified in this table-version
-            elif type_info != last_table_columns[column_name]:
-                copy_columns[column_name].append(real_table_name)
+                # This column was modified in this table-version
+                elif type_info != last_table_columns[column_name]:
+                    column_versions[column_name].append(real_table_name)
 
-            # Otherwise, this column is the same as the previous version; all changes are back
-            # propagated so we don't need to do anything
+                # Otherwise, this column is the same as the previous version; all changes are back
+                # propagated so we don't need to do anything
 
         last_table_columns = columns
 
     first_table = make_real_table_name(table_name, first_table_version)
-    join_tables = set(itertools.chain.from_iterable(copy_columns.itervalues()))
+    join_tables = set(itertools.chain.from_iterable(column_versions.itervalues()))
     join_tables.remove(first_table)
 
-    return first_table, copy_columns, join_tables
+    return first_table, column_versions, join_tables
+
+
+def make_join_string(first_table, join_tables, primary_key):
+    """
+    Make a join string for the bracketed parts in SELECT ... FROM [...] or UPDATE [...]
+    :param first_table: earliest version of the table
+    :param join_tables: other versions to join with
+    :param primary_key: primary key to join on
+    :return: a SQL query part similar to '`a` LEFT OUTER JOIN `b` USING `id` LEFT OUTER JOIN...'
+    """
+    left_outer_joins = ['LEFT OUTER JOIN `{table}` ON '
+                        '`{orig_table}`.`{primary_key}` = `{table}`.`{primary_key}`'.format(
+        table=join_table, orig_table=first_table, primary_key=primary_key)
+                        for join_table in join_tables]
+    return '`{table}` {joins}'.format(table=first_table, joins=' '.join(left_outer_joins))
+
+
+def make_columns_string():
+    """
+    Make a columns string for the part in between SELECT and FROM. Can also be
+    used for other fields.
+    :return:
+    """
 
 
 def generate_propagate_sql(latest_version_table_name, table_name, table_schemas, primary_key,
                            where):
     """
-    Generates a SELECT for the INSERT INTO... SELECT queries.
-    :return: string of SELECT sql
+    Generates an INSERT INTO... SELECT query for version migrations.
+    :param latest_version_table_name: name of the latest version into which we're inserting
+    :param table_name: user-facing table name
+    :param table_schemas: the schema of the current table, in the form of
+                          schema = (version, [('column name' => column info)...)
+    :param primary_key: column of the primary key of the table
+    :type primary_key: str
+    :param where: the parsed group containing the WHERE conditions
+    :type where: sqlparse.sql.Where
+    :return: string of INSERT INTO ... SELECT sql
     :rtype: str
     """
-    first_table, copy_columns, join_tables = generate_propagate_arguments_for_table(
+    first_table, copy_columns, join_tables = generate_select_arguments(
         table_name, table_schemas)
 
     selects = []
@@ -1015,11 +1077,7 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
 
     selects = ', '.join(selects)
 
-    left_outer_joins = ['LEFT OUTER JOIN {table} ON '
-                        '{orig_table}.{primary_key} = {table}.{primary_key}'.format(
-                            table=join_table, orig_table=table_name, primary_key=primary_key)
-                        for join_table in join_tables]
-    left_outer_joins = '\n'.join(left_outer_joins)
+    left_outer_joins = make_join_string(first_table, join_tables, primary_key)
 
     new_where = copy.deepcopy(where)
     replace_where_identifiers(new_where, {table_name: copy_columns})
@@ -1118,27 +1176,61 @@ def convert_comparison_for_multi_table(comparison_token, parent_token, column, t
     parenthesis.tokens.append(psql.Token(ptokens.Punctuation, ')'))
 
 
-def replace_where_identifiers(where_token, tables_columns):
+def replace_identifiers(tokens, column_versions):
     """
     Replaces the identifiers in the tokens list. Note that while this only works for WHERE
     clauses right now, it's very easily adaptable. The only WHERE-specific code is right after
+    the "else"
 
-    :param tokens:
-    :type tokens:
-    :param tables_columns: a dict of 'table' => {'col' => ['subtable1', ...]}
-    :type tables_columns: dict of (str -> dict of (str -> list of str))
+    :param where_token: the Where group token group
+    :type where_token: sqlparse.sql.Where
+    :param column_versions: a dict of 'table' => {'col' => ['subtable1', ...]}
+    :type column_versions: dict of (str -> dict of (str -> list of str))
+    :rtype:
+    """
+    identifiers = find_identifiers_with_name_sub_token(tokens)
+    for identifier in identifiers:
+        table, column = separate_table_and_column(identifier, None)
+        if table is None:
+            table = infer_table(column, column_versions)
+        if table is None or not table:
+            continue
+
+        real_table_candidates = column_versions[table][column]
+
+        sql_fragments = ['`{table}`.`{column}`'.format(
+            table=real_table, column = column) for real_table in real_table_candidates]
+
+        if len(sql_fragments) == 1:
+            identifier.tokens = psqle.parse(sql_fragments[0])
+        else:
+            identifier.tokens = psqle.parse('COALESCE({}) AS {}'.format(', '.join(sql_fragments),
+                column))
+
+
+def replace_where_identifiers(where_token, column_versions):
+    """
+    Replaces the identifiers in the tokens list. Note that while this only works for WHERE
+    clauses right now, it's very easily adaptable. The only WHERE-specific code is right after
+    the "else"
+
+    :param where_token: the Where group token group
+    :type where_token: sqlparse.sql.Where
+    :param column_versions: a dict of 'table' => {'col' => ['subtable1', ...]}
+    :type column_versions: dict of (str -> dict of (str -> list of str))
     :rtype:
     """
 
     identifiers = find_identifiers_with_name_sub_token(where_token.tokens)
+
     for identifier in identifiers:
         table, column = separate_table_and_column(identifier, None)
         if table is None:
-            table = infer_table(column, tables_columns)
+            table = infer_table(column, column_versions)
         if table is None or not table:
             continue
 
-        real_table_candidates = tables_columns[table][column]
+        real_table_candidates = column_versions[table][column]
         if len(real_table_candidates) == 1:
             real_table = real_table_candidates[0]
 
@@ -1149,31 +1241,28 @@ def replace_where_identifiers(where_token, tables_columns):
             ]
         else:
             # TODO: note this doesn't deal with IS NULL or IS NOT NULL comparators
-            comparison_token, parent_token = find_comparison_with_identifier(where_token,
-                                                                             identifier)
+            output = find_comparison_with_identifier(where_token, identifier)
+            # If output is null, we have a "column = 123": encapsulate identifier, operator, next token
+            if output is None:
+                comparison = psql.Comparison()
+                operator = where_token.token_next(where_token.token_index(identifier))
+                value = where_token.token_next(where_token.token_index(operator))
+                comparison.tokens = [
+                    identifier,
+                    psql.Token(ptokens.Whitespace, ' '),
+                    operator,
+                    psql.Token(ptokens.Whitespace, ' '),
+                    value
+                ]
+                del where_token.tokens[where_token.token_index(value)]
+                del where_token.tokens[where_token.token_index(operator)]
+                id_index = where_token.token_index(identifier)
+                del where_token.tokens[id_index]
+                where_token.tokens.insert(id_index, comparison)
+
+                # Fetch it again
+                output = find_comparison_with_identifier(where_token, identifier)
+
+            comparison_token, parent_token = output
             convert_comparison_for_multi_table(comparison_token, parent_token, column,
-                                               real_table_candidates)
-
-
-conn = Connection(original_conn)
-cur = conn.cursor()
-
-stmt = psqle.parse("UPDATE test_table SET cash=394 WHERE (name='George Bush') AND college='Davenport'")[0]
-# #insert_replace_table_name(stmt, 'blah_table')
-# stmt = psqle.parse("INSERT INTO test_table (sid, name, college, cash) VALUES"
-#                       "(10210101, 'George Bush', 'Davenport', 9999999.54)")[0]
-#print_token_children(stmt)
-#stmt = psqle.parse("SELECT id AS tableId, uid, table.field, `blah` FROM table1 ORDER BY id ASC, uid DESC GROUP BY id DESC")[0]
-
-cur.execute("INSERT INTO test_table (sid, name, college, cash) VALUES"
-            "(10210101, 'George Bush', 'Davenport', 9999999.54)")
-conn.commit()
-cur.execute("UPDATE test_table SET cash = 'none' WHERE name = 'George Bush'")
-conn.commit()
-# cur.execute("INSERT INTO test_table (sid, name, college, cash, class_year) VALUES "
-#             "(909876541,'Peter Xu', 'Saybrook', 12.34, '2014')")
-# conn.commit()
-# cur.execute("INSERT INTO test_table (id, name, college, cash, class_year) VALUES "
-#             "(909876542, 'Peter Xu', 'Morse', 'no mo money yo', '2014')")
-# conn.commit()
-
+                real_table_candidates)
