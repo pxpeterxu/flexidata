@@ -816,7 +816,7 @@ def retrieve_schemas(conn):
             all2 = cur.fetchall()
 
         tables_info[table] = OrderedDict()
-        for col_info in all2:
+        for col_info in all2 or (len(all2) != 0 and u'Field' not in all2[0]):
             column_name = col_info[u'Field']
             tables_info[table][column_name] = extract_type_data(col_info[u'Type'])
             if 'PRI' in col_info[u'Key']:
@@ -825,7 +825,7 @@ def retrieve_schemas(conn):
     cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
                 "'{}'".format(conn.db))
     all3 = cur.fetchall()
-    if all3 is None:
+    if all3 is None or (len(all3) != 0 and u'TABLE_NAME' not in all3[0]):
         cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
                     "'{}'".format(conn.db))
         all3 = cur.fetchall()
