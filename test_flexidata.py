@@ -27,6 +27,11 @@ original_conn = pymysql.connect(
     passwd=settings.flexidata_password,
     host=settings.flexidata_host)
 
+# Disable query cache for
+original_cursor = original_conn.cursor()
+original_cursor.execute('SET SESSION query_cache_type = OFF')
+original_conn.commit()
+
 if conn_type == 'pymysql':
     conn = original_conn
 elif conn_type == 'flexidata':
