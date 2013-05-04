@@ -918,7 +918,8 @@ def generate_column_definitions(col_info):
             col_str = '{} {} NULL'.format(col_name, col_type)
         if 'primary' in col_type_info:
             col_str = col_str.replace('NULL', 'NOT NULL')
-            col_str += ' AUTO_INCREMENT'
+            if col_type.endswith('int'):
+                col_str += ' AUTO_INCREMENT'
             primary_column = col_name
         column_definitions.append(col_str)
 
