@@ -54,7 +54,6 @@ class Connection(object):
         self.conn.escape(obj)
 
     def _refresh_schemas(self):
-        print 'refreshing'
         self.schemas, self.num_rows, primary_keys = retrieve_schemas(self.conn)
         self.primary_keys = {}
         for table_name, key in primary_keys.iteritems():
@@ -68,7 +67,6 @@ class Connection(object):
                 # Set primary key as first column if it's not set
                 self.primary_keys[base_table_name] = next(sub_tables[1].iterkeys())
 
-        print 'refreshed'
         # self.schemas is in the form of
         # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
 
@@ -806,8 +804,6 @@ def retrieve_schemas(conn):
     for table in tables:
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
         tables_info[table] = OrderedDict()
-
-        first_col_name = None
         for col_info in cur.fetchall():
             column_name = col_info[u'Field']
             tables_info[table][column_name] = extract_type_data(col_info[u'Type'])
