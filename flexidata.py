@@ -194,10 +194,10 @@ class Cursor(object):
         where_token = stmt.token_next_by_instance(0, psql.Where)
         table_name, _, _ = update_find_data(stmt)
 
-        primary_key = self.conn.primary_keys[real_table_name] \
-            if real_table_name in self.conn.primary_keys else None
+        primary_key = self.conn.primary_keys[table_name] \
+            if table_name in self.conn.primary_keys else None
         propagate_sql = generate_propagate_sql(real_table_name, table_name,
-                                               self.conn.schemas[real_table_name],
+                                               self.conn.schemas[table_name],
                                                primary_key,
                                                where_token)
         self.cursor.execute('SET @disable_triggers = 1;')
@@ -528,7 +528,8 @@ def find_columns_in_where_old(stmt):
     """
     columns = set()
     where = stmt.token_next_by_instance(0, psql.Where)
-    assert isinstance(where, psql.Where)
+    if where is None:
+        return columns
     comparisons = find_tokens_by_instance(where.tokens, psql.Comparison, True)
 
     for comparison in comparisons:
@@ -1032,9 +1033,17 @@ def generate_triggers(old_table, new_table, shared_columns):
                      "  IF (@disable_triggers IS NULL) THEN \n" \
                      "      INSERT INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
                      "  END IF; \n" \
-                     "END;".format(source_table=new_table, dest_table=old_table,
+                     "END;\n".format(source_table=new_table, dest_table=old_table,
                                    cols=cols, new_plus_cols=cols_new)
-    return insert_trigger
+
+    update_trigger = "CREATE TRIGGER {source_table}_update AFTER UPDATE ON {source_table} \n" \
+                     "FOR EACH ROW BEGIN \n" \
+                     "  IF (@disable_triggers IS NULL) THEN \n" \
+                     "      REPLACE INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
+                     "  END IF; \n" \
+                     "END;\n".format(source_table=new_table, dest_table=old_table,
+                                   cols=cols, new_plus_cols=cols_new)
+    return insert_trigger + update_trigger
 
 def generate_select_arguments(table_name, table_schemas, columns_present=None):
     """
@@ -1129,7 +1138,7 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
     :rtype: str
     """
     if primary_key is None:
-        primary_key = next(next(table_schemas.itervalues()).iterkeys())
+        primary_key = next(table_schemas[0][1].iterkeys())
     first_table, copy_columns, join_tables = generate_select_arguments(
         table_name, table_schemas)
 
@@ -1146,10 +1155,13 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
 
     left_outer_joins = make_join_string(first_table, join_tables, primary_key)
 
-    new_where = copy.deepcopy(where)
-    replace_where_identifiers(new_where, {table_name: copy_columns})
+    if not where:
+        new_where = ''
+    else:
+        new_where = copy.deepcopy(where)
+        replace_where_identifiers(new_where, {table_name: copy_columns})
 
-    full_select = 'SELECT {selects} FROM {table} {left_outer_joins} {where_str}'.format(
+    full_select = 'SELECT {selects} FROM {left_outer_joins} {where_str}'.format(
         selects=selects, table=table_name, left_outer_joins=left_outer_joins, where_str=new_where)
 
     insert_columns = ', '.join(copy_columns.keys())
@@ -1287,6 +1299,8 @@ def replace_where_identifiers(where_token, column_versions):
     :type column_versions: dict of (str -> dict of (str -> list of str))
     :rtype:
     """
+    if where_token is None:
+        return
 
     identifiers = find_identifiers_with_name_sub_token(where_token.tokens)
 
