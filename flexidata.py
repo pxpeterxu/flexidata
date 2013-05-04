@@ -30,11 +30,7 @@ class Connection(object):
         :type conn: pymysql.connections.Connection
         """
         self.conn = conn
-        self._refresh_schemas()
-
-    def begin(self):
-        self.conn.begin()
-        self._refresh_schemas()
+        self.refresh_schemas()
 
     def close(self):
         self.conn.close()
@@ -42,7 +38,8 @@ class Connection(object):
     def commit(self):
         self.conn.commit()
         # New transaction, so refresh schema
-        self._refresh_schemas()
+        # Unnecessary unless we have multiple consumers
+        self.refresh_schemas()
 
     def rollback(self):
         self.conn.rollback()
@@ -53,7 +50,7 @@ class Connection(object):
     def escape(self, obj):
         self.conn.escape(obj)
 
-    def _refresh_schemas(self):
+    def refresh_schemas(self):
         self.schemas, self.num_rows, primary_keys = retrieve_schemas(self.conn)
         self.primary_keys = {}
         for table_name, key in primary_keys.iteritems():
@@ -65,7 +62,7 @@ class Connection(object):
         for base_table_name, sub_tables in self.schemas.iteritems():
             if base_table_name not in self.primary_keys:
                 # Set primary key as first column if it's not set
-                self.primary_keys[base_table_name] = next(sub_tables[1].iterkeys())
+                self.primary_keys[base_table_name] = next(sub_tables[0][1].iterkeys())
 
         # self.schemas is in the form of
         # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
@@ -146,7 +143,7 @@ class Cursor(object):
                 create_table_sql = generate_create_table(real_table_name, create_schema, primary_key)
                 self.raw_cursor.execute(create_table_sql)
 
-            self.conn._refresh_schemas()
+            self.conn.refresh_schemas()
         else:
             real_table_name = make_real_table_name(table_name, schemas[table_name][0][0])
 
@@ -798,7 +795,10 @@ def retrieve_schemas(conn):
     """
     cur = conn.cursor()
     cur.execute('SHOW TABLES')
-    tables = [row[0] for row in cur.fetchall()]
+    rows = cur.fetchall()
+    if rows is None:
+        return {}, {}, {}
+    tables = [row[0] for row in rows]
 
     cur = conn.cursor(pymysql.cursors.DictCursor)
 
@@ -930,8 +930,9 @@ def generate_column_definitions(col_info):
 
 
 def generate_create_table(table_name, table_schema, primary_key_column):
-    if primary_key_column in table_schema:
-        table_schema[primary_key_column]['primary'] = True
+    if primary_key_column not in table_schema:
+        table_schema[primary_key_column] = {'type': 'int', 'length': 0}
+    table_schema[primary_key_column]['primary'] = True
 
     col_strs = generate_column_definitions(table_schema)
     return 'CREATE TABLE {} (\n{}\n)'.format(table_name, ',\n'.join(col_strs))
@@ -992,7 +993,7 @@ def generate_new_schema(existing_schema, query_schema):
     :return: three dicts, one with a schema for CREATE, one with a schema for columns to
              be ADDed in an ALTER query, and finally one with a schema for columns to be
              MODIFYed in an ALTER query
-    :rtype: (dict, dict, dict)
+    :rtype: (OrderedDict, OrderedDict, dict)
     """
     create_schema = OrderedDict()
     add_schema = OrderedDict()
