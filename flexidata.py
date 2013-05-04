@@ -1,7 +1,5 @@
 __author__ = 'User'
 
-import sqlparse
-
 from sqlparse import sql as psql
 from sqlparse import tokens as ptokens
 
@@ -60,12 +58,16 @@ class Connection(object):
         self.schemas, self.num_rows, primary_keys = retrieve_schemas(self.conn)
         self.primary_keys = {}
         for table_name, key in primary_keys.iteritems():
-            if '__' in table_name:
-                base_table_name = table_name[:table_name.find('__')]
-                if base_table_name not in self.primary_keys:
-                    self.primary_keys[base_table_name] = key
+            base_table_name = get_base_table(table_name)
+            if base_table_name not in self.primary_keys:
+                self.primary_keys[base_table_name] = key
 
         self.schemas = group_schemas(self.schemas, self.num_rows)
+        for base_table_name, sub_tables in self.schemas.iteritems():
+            if base_table_name not in self.primary_keys:
+                # Set primary key as first column if it's not set
+                self.primary_keys[base_table_name] = next(sub_tables[1].iterkeys())
+
         print 'refreshed'
         # self.schemas is in the form of
         # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
@@ -484,7 +486,7 @@ def find_columns_in_orderby_groupby(stmt, default_table):
     :return: a set of [(table, column), ...] as strings
     """
     identifiers = find_tokens_by_instance(stmt.tokens, psql.Identifier)
-    return set(separate_table_and_column(id, default_table) for id in identifiers)
+    return set(separate_table_and_column(identifier, default_table) for identifier in identifiers)
 
 
 def find_identifiers_with_name_sub_token(tokens):
@@ -736,8 +738,8 @@ def select_find_columns(stmt, default_table):
 
     # Could either be multiple identifiers, SELECT *, ..., or SELECT id FROM
     if isinstance(next_token, psql.IdentifierList):
-        identifiers = find_tokens_by_instance(next_token.tokens, psql.Identifier) +\
-                      find_tokens_by_type(next_token.tokens, ptokens.Wildcard)
+        identifiers = find_tokens_by_instance(next_token.tokens, psql.Identifier) + \
+                        find_tokens_by_type(next_token.tokens, ptokens.Wildcard)
     else: # isinstance(next_token, psql.Identifier) or next_token.ttype == ptokens.Wildcard:
         identifiers = [next_token]
 
@@ -804,6 +806,8 @@ def retrieve_schemas(conn):
     for table in tables:
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
         tables_info[table] = OrderedDict()
+
+        first_col_name = None
         for col_info in cur.fetchall():
             column_name = col_info[u'Field']
             tables_info[table][column_name] = extract_type_data(col_info[u'Type'])
@@ -897,7 +901,7 @@ def generate_column_definitions(col_info):
 
     :param col_info: OrderedDict with column_name keys and values of dicts containing
                      'type' and 'length' and 'primary' (optional)
-    :type col_info: OrderedDict
+    :type col_info: dict
     :return: a list of column definitions
     :rtype: list of str
     """
@@ -944,11 +948,11 @@ def generate_alter_table(table_name, add_column_schema, modify_column_schema):
     :param add_column_schema: schema of the columns to add with ADD COLUMN in the
                               form of an OrderedDict with column_name keys and values
                               of dicts containing 'type' and 'length'
-    :type add_column_schema: OrderedDict
+    :type add_column_schema: dict
     :param modify_column_schema: schema of the columns to add with MODIFY COLUMN in the
                                  form of an OrderedDict with column_name keys and values
                                  of dicts containing 'type' and 'length'
-    :type modify_column_schema: OrderedDict
+    :type modify_column_schema: dict
     :return:
     """
     add_strs = generate_column_definitions(add_column_schema)
@@ -1034,7 +1038,7 @@ def generate_triggers(old_table, new_table, shared_columns):
                      "      INSERT INTO {dest_table} ({cols}) VALUES ({new_plus_cols}); \n" \
                      "  END IF; \n" \
                      "END;\n".format(source_table=new_table, dest_table=old_table,
-                                   cols=cols, new_plus_cols=cols_new)
+                                     cols=cols, new_plus_cols=cols_new)
 
     update_trigger = "CREATE TRIGGER {source_table}_update AFTER UPDATE ON {source_table} \n" \
                      "FOR EACH ROW BEGIN \n" \
@@ -1178,7 +1182,7 @@ def infer_table(column, tables_columns):
 
     :type column: str
     :param tables_columns: a dict of 'table' => {'col' => ['subtable1', ...]}
-    :type tables_columns: dict of (str -> dict of (str -> list of str))
+    :type tables_columns: dict of (str, dict)
     :return: the string name of the table; None if it doesn't exist, or False on conflict
     :rtype: str | None | False
     """
@@ -1261,10 +1265,10 @@ def replace_identifiers(tokens, column_versions):
     clauses right now, it's very easily adaptable. The only WHERE-specific code is right after
     the "else"
 
-    :param where_token: the Where group token group
-    :type where_token: sqlparse.sql.Where
+    :param tokens: the tokens to replace, recursively
+    :type tokens: list of sqlparse.sql.Token
     :param column_versions: a dict of 'table' => {'col' => ['subtable1', ...]}
-    :type column_versions: dict of (str -> dict of (str -> list of str))
+    :type column_versions: dict of (str, dict)
     :rtype:
     """
     identifiers = find_identifiers_with_name_sub_token(tokens)
@@ -1296,7 +1300,7 @@ def replace_where_identifiers(where_token, column_versions):
     :param where_token: the Where group token group
     :type where_token: sqlparse.sql.Where
     :param column_versions: a dict of 'table' => {'col' => ['subtable1', ...]}
-    :type column_versions: dict of (str -> dict of (str -> list of str))
+    :type column_versions: dict of (str, dict)
     :rtype:
     """
     if where_token is None:
@@ -1347,3 +1351,9 @@ def replace_where_identifiers(where_token, column_versions):
             comparison_token, parent_token = output
             convert_comparison_for_multi_table(comparison_token, parent_token, column,
                                                real_table_candidates)
+
+def get_base_table(real_table_name):
+    if '__' in real_table_name:
+        return real_table_name[:real_table_name.find('__')]
+    else:
+        return real_table_name
