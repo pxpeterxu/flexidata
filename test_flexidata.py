@@ -41,6 +41,6 @@ for sql_statement in sql_statements:
     if sql_statement.startswith('SELECT'):
         result.fetchall()
     else:
-        cursor.commit()
+        conn.commit()
 
     times.append(time.time() - start_time)
