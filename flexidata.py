@@ -176,6 +176,16 @@ class Cursor(object):
 
         return self._prepare_schema(table_name, query_minimum_schema)
 
+    def _prepare_for_delete(self, stmt):
+        table_name, row_data, _ = update_find_data(stmt)
+        types, lengths = find_minimum_types_for_values([row_data.values()])
+
+        query_minimum_schema = OrderedDict()
+        for info in zip(row_data.keys(), types, lengths):
+            query_minimum_schema[info[0]] = {'type': info[1], 'length': info[2]}
+
+        return self._prepare_schema(table_name, query_minimum_schema)
+
     def _insert_data_for_update(self, stmt, real_table_name):
         """
         Propagates data matching the UPDATE conditions from the older tables to the newer
@@ -230,7 +240,7 @@ class Cursor(object):
         where = stmt.token_next_by_instance(0, psql.Where)
         having = stmt.token_next_by_instance(0, psqle.Having)
 
-        table_strings = []
+        table_strings = {}
         for table in tables:
             schema = schemas[table]
             column_info = schema[0][1]
@@ -242,7 +252,7 @@ class Cursor(object):
 
             first_table, column_versions, join_tables = generate_select_arguments(
                 table, schema, columns_to_get)
-            table_strings.append(make_join_string(first_table, join_tables, column_info.keys()[0]))
+            table_strings[table] = make_join_string(first_table, join_tables, column_info.keys()[0])
             replace_identifiers(column_tokens, {table: column_versions})
             if group_by is not None:
                 replace_identifiers(group_by.tokens, {table: column_versions})
@@ -253,7 +263,8 @@ class Cursor(object):
             if where is not None:
                 replace_where_identifiers(where, {table: column_versions})
 
-        from_token.tokens = psqle.parse('FROM ' + ', '.join(table_strings))
+        # TODO(peterxu) make it so that we replace table names instead of just replacing everything
+        from_token.tokens = psqle.parse('FROM ' + ', '.join(table_strings.itervalues()))
         return stmt
 
     def execute(self, query, args=None):
@@ -268,6 +279,9 @@ class Cursor(object):
             if stmt.token_next_match(0, ptokens.DML, 'UPDATE') is not None:
                 real_table_name = self._prepare_for_update(stmt)
                 self._insert_data_for_update(stmt, real_table_name)
+                update_replace_table_name(stmt, real_table_name)
+            if stmt.token_next_match(0, ptokens.DML, 'DELETE') is not None:
+                real_table_name = self._prepare_for_delete(stmt)
                 update_replace_table_name(stmt, real_table_name)
 
             if stmt.token_next_match(0, ptokens.DML, 'SELECT') is not None:
@@ -840,15 +854,26 @@ def find_minimum_types_for_values(value_sets):
 
     # Initialize for number of columns
     num_columns = len(value_sets[0])
-    col_types = ['int'] * num_columns
+    col_types = ['tinyint'] * num_columns
     col_lengths = [0] * num_columns
 
     for values in value_sets:
         # We drop down the type to a more general type once it fails on anything
         for col_index, value in enumerate(values):
-            if col_types[col_index] == 'int':
+            if col_types[col_index].endswith('int'):
                 try:
-                    int(value)
+                    abs_int_value = abs(int(value))
+                    if abs_int_value < 128:
+                        col_types[col_index] = 'tinyint'
+                    elif abs_int_value < 32768:
+                        col_types[col_index] = 'smallint'
+                    elif abs_int_value < 8388608:
+                        col_types[col_index] = 'mediumint'
+                    elif abs_int_value < 2147483648:
+                        col_types[col_index] = 'int'
+                    else:
+                        col_types[col_index] = 'bigint'
+
                 except ValueError:
                     col_types[col_index] = 'double'
 
@@ -939,7 +964,11 @@ def flexibility_score(column_info):
     the schema, higher flexibility always wins.
     """
     type_flexibility = {
-        'int': 100000,
+        'tinyint': 100100,
+        'smallint': 100200,
+        'mediumint': 100300,
+        'int': 100400,
+        'bigint': 100500,
         'double': 200000,
         'varchar': 300000
     }
@@ -977,6 +1006,9 @@ def generate_new_schema(existing_schema, query_schema):
 
     for column_name, query_column in query_schema.iteritems():
         if column_name not in create_schema:
+            if query_column['type'].endswith('int'):
+                # Start off all int types as INT rather than TINYINT, etc.
+                query_column['type'] = 'int'
             create_schema[column_name] = query_column
             add_schema[column_name] = query_column
 
