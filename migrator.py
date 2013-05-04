@@ -34,6 +34,7 @@ def get_table_migration_states(conn):
         cur.execute(create_migrations_sql)
         conn.commit()
 
+    conn.refresh_schemas()
     cur.execute('SELECT base_table, subtable_index, last_id_processed FROM migrations')
     last_processed = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
 
