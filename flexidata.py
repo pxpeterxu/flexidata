@@ -929,7 +929,13 @@ def generate_column_definitions(col_info):
 
 
 def generate_create_table(table_name, table_schema, primary_key_column):
+    # TODO(harryyu) Primary key handling is currently hack-ish
+    # We use an existing primary key if it's specified
+    # We use a specified column as a primary key, defining the column if necessary
+    # Otherwise, we just create a random column called id
     if primary_key_column not in table_schema:
+        if primary_key_column is None:
+            primary_key_column = 'id'
         table_schema[primary_key_column] = {'type': 'int', 'length': 0}
     table_schema[primary_key_column]['primary'] = True
 
