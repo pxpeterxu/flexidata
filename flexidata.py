@@ -816,7 +816,7 @@ def retrieve_schemas(conn):
             all2 = cur.fetchall()
 
         tables_info[table] = OrderedDict()
-        for col_info in cur.fetchall():
+        for col_info in all2:
             column_name = col_info[u'Field']
             tables_info[table][column_name] = extract_type_data(col_info[u'Type'])
             if 'PRI' in col_info[u'Key']:
