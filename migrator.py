@@ -13,7 +13,7 @@ def get_table_migration_states(conn):
 
     :param conn:
     :type conn: flexidata.Connection
-    :return:
+    :return: a dict of real_table_name => last_id_processed
     :rtype:
     """
     cur = conn.cursor()
@@ -40,6 +40,9 @@ def get_table_migration_states(conn):
 
 def migrate_table(conn, subtable_name, last_processed, num_to_process):
     """
+    Migrates the next blah IDs to the subtable. This doesn't check when it's done though!
+    Be careful!
+
     :type conn: flexidata.Connection
     """
     base_table = get_base_table(subtable_name)
