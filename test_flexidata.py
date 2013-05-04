@@ -34,11 +34,11 @@ elif conn_type == 'flexidata':
 cursor = conn.cursor()
 
 times = []
+start_time = time.time()
 for sql_statement in sql_statements:
-    times.append(time.time())
     result = cursor.execute(sql_statement)
 
     if sql_statement.startswith('SELECT'):
         result.fetchall()
 
-times.append(time.time())
+    times.append(time.time() - start_time)
