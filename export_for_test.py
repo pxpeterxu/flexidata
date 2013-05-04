@@ -18,7 +18,8 @@ results = cursor.fetchall()
 
 for result in results:
     query = 'INSERT INTO {table} ({columns}) VALUES ({values})'.format(table=table,
-        columns=', '.join(result.keys()), values=', '.join(result.values()))
+        columns=', '.join([str(key) for key in result.keys()]),
+        values=', '.join([str(val) for val in result.values()]))
     print query
 
 
