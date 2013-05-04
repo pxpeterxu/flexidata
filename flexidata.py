@@ -62,13 +62,17 @@ class Connection(object):
         for table_name, key in primary_keys.iteritems():
             if '__' in table_name:
                 base_table_name = table_name[:table_name.find('__')]
-                if not base_table_name in self.primary_keys:
+                if base_table_name not in self.primary_keys:
                     self.primary_keys[base_table_name] = key
 
         self.schemas = group_schemas(self.schemas, self.num_rows)
         print 'refreshed'
         # self.schemas is in the form of
         # 'table_name' => [(subtable_number, subtable_schema, num_rows)]
+
+    def hint_primary_key(self, table, primary_key):
+        if table not in self.primary_keys:
+            self.primary_keys[table] = primary_key
 
 
 class Cursor(object):
@@ -100,6 +104,7 @@ class Cursor(object):
 
     def _prepare_schema(self, table_name, query_schema):
         schemas = self.conn.schemas
+        primary_keys = self.conn.primary_keys
 
         # Finds existing table schema
         if table_name not in schemas:
@@ -119,17 +124,23 @@ class Cursor(object):
         if add_schema or modify_schema:
             # TODO(hsource) Currently all and any schema changes result in a new table; wasteful
             real_table_name = make_real_table_name(table_name, new_table_version)
-            create_table_sql = generate_create_table(real_table_name, create_schema)
-            self.cursor.execute(create_table_sql)
 
-            # Triggers
+            # Create from old table
             if old_table_version is not None:
                 old_table_name = make_real_table_name(table_name, old_table_version)
+                create_table_sql = generate_create_table_using_like(real_table_name, old_table_name)
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
                                                        shared_columns)
+                modify_table_sql = generate_alter_table(real_table_name, add_schema, modify_schema)
+                self.cursor.execute(create_table_sql)
+                self.cursor.execute(modify_table_sql)
                 self.cursor.execute(create_trigger_sql)
+            else:
+                primary_key = primary_keys[table_name] if table_name in primary_keys else None
+                create_table_sql = generate_create_table(real_table_name, create_schema, primary_key)
+                self.cursor.execute(create_table_sql)
 
             self.conn._refresh_schemas()
         else:
@@ -173,7 +184,12 @@ class Cursor(object):
         where_token = stmt.token_next_by_instance(0, psql.Where)
         table_name, _, _ = update_find_data(stmt)
 
-        propagate_sql = generate_propagate_sql(real_table_name, table_name, self.conn.schemas[real_table_name], 'sid', where_token)
+        primary_key = self.conn.primary_keys[real_table_name] \
+            if real_table_name in self.conn.primary_keys else None
+        propagate_sql = generate_propagate_sql(real_table_name, table_name,
+                                               self.conn.schemas[real_table_name],
+                                               primary_key,
+                                               where_token)
         self.cursor.execute('SET @disable_triggers = 1;')
         self.cursor.execute(propagate_sql)
         self.cursor.execute('SET @disable_triggers = NULL;')
@@ -854,12 +870,14 @@ def generate_column_definitions(col_info):
     to ALTER TABLE or CREATE TABLE.
 
     :param col_info: OrderedDict with column_name keys and values of dicts containing
-                     'type' and 'length'
+                     'type' and 'length' and 'primary' (optional)
     :type col_info: OrderedDict
     :return: a list of column definitions
     :rtype: list of str
     """
     column_definitions = []
+    primary_column = None
+
     for col_name, col_type_info in col_info.iteritems():
         col_type = col_type_info['type']
         col_length = col_type_info['length']
@@ -868,14 +886,28 @@ def generate_column_definitions(col_info):
             col_str = '{} {}({}) NULL'.format(col_name, col_type, col_length)
         else:
             col_str = '{} {} NULL'.format(col_name, col_type)
+        if 'primary' in col_type_info:
+            col_str = col_str.replace('NULL', 'NOT NULL')
+            col_str += ' AUTO_INCREMENT'
+            primary_column = col_name
         column_definitions.append(col_str)
+
+    if primary_column is not None:
+        column_definitions.append('PRIMARY KEY ({})'.format(primary_column))
 
     return column_definitions
 
 
-def generate_create_table(table_name, table_schema):
+def generate_create_table(table_name, table_schema, primary_key_column):
+    if primary_key_column in table_schema:
+        table_schema[primary_key_column]['primary'] = True
+
     col_strs = generate_column_definitions(table_schema)
     return 'CREATE TABLE {} (\n{}\n)'.format(table_name, ',\n'.join(col_strs))
+
+
+def generate_create_table_using_like(table_name, old_table_name):
+    return 'CREATE TABLE {} LIKE {}'.format(table_name, old_table_name)
 
 
 def generate_alter_table(table_name, add_column_schema, modify_column_schema):
@@ -1056,13 +1088,16 @@ def generate_propagate_sql(latest_version_table_name, table_name, table_schemas,
     :param table_name: user-facing table name
     :param table_schemas: the schema of the current table, in the form of
                           schema = (version, [('column name' => column info)...)
-    :param primary_key: column of the primary key of the table
-    :type primary_key: str
+    :type table_schemas OrderedDict
+    :param primary_key: column of the primary key of the table or None
+    :type primary_key: str | None
     :param where: the parsed group containing the WHERE conditions
     :type where: sqlparse.sql.Where
     :return: string of INSERT INTO ... SELECT sql
     :rtype: str
     """
+    if primary_key is None:
+        primary_key = next(next(table_schemas.itervalues()).iterkeys())
     first_table, copy_columns, join_tables = generate_select_arguments(
         table_name, table_schemas)
 
@@ -1265,4 +1300,4 @@ def replace_where_identifiers(where_token, column_versions):
 
             comparison_token, parent_token = output
             convert_comparison_for_multi_table(comparison_token, parent_token, column,
-                real_table_candidates)
+                                               real_table_candidates)
