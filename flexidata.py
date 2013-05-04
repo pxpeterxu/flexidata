@@ -797,7 +797,10 @@ def retrieve_schemas(conn):
     cur.execute('SHOW TABLES')
     rows = cur.fetchall()
     if rows is None:
-        return {}, {}, {}
+        cur.execute('SHOW TABLES')
+        rows = cur.fetchall()
+        if rows is None:
+            return {}, {}, {}
     tables = [row[0] for row in rows]
 
     cur = conn.cursor(pymysql.cursors.DictCursor)
@@ -807,6 +810,11 @@ def retrieve_schemas(conn):
 
     for table in tables:
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
+        all2 = cur.fetchall()
+        if all2 is None:
+            cur.execute('SHOW COLUMNS FROM {}'.format(table))
+            all2 = cur.fetchall()
+
         tables_info[table] = OrderedDict()
         for col_info in cur.fetchall():
             column_name = col_info[u'Field']
@@ -816,8 +824,13 @@ def retrieve_schemas(conn):
 
     cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
                 "'{}'".format(conn.db))
+    all3 = cur.fetchall()
+    if all3 is None:
+        cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
+                    "'{}'".format(conn.db))
+        all3 = cur.fetchall()
     tables_num_rows = {col_info[u'TABLE_NAME']: int(col_info['TABLE_ROWS'])
-                       for col_info in cur.fetchall()}
+                       for col_info in all3}
 
     return tables_info, tables_num_rows, primary_keys
 
