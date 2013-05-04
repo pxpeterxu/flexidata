@@ -27,6 +27,11 @@ original_conn = pymysql.connect(
     passwd=settings.flexidata_password,
     host=settings.flexidata_host)
 
+# Disable query cache for
+original_cursor = original_conn.cursor()
+original_cursor.execute('SET SESSION query_cache_type = OFF')
+original_conn.commit()
+
 if conn_type == 'pymysql':
     conn = original_conn
 elif conn_type == 'flexidata':
@@ -36,10 +41,10 @@ cursor = conn.cursor()
 times = []
 start_time = time.time()
 for sql_statement in sql_statements:
-    result = cursor.execute(sql_statement)
+    cursor.execute(sql_statement)
 
     if sql_statement.startswith('SELECT'):
-        result.fetchall()
+        cursor.fetchall()
     else:
         conn.commit()
 
