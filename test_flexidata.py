@@ -41,10 +41,10 @@ cursor = conn.cursor()
 times = []
 start_time = time.time()
 for sql_statement in sql_statements:
-    result = cursor.execute(sql_statement)
+    cursor.execute(sql_statement)
 
     if sql_statement.startswith('SELECT'):
-        result.fetchall()
+        cursor.fetchall()
     else:
         conn.commit()
 
