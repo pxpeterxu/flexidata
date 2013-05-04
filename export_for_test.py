@@ -17,7 +17,7 @@ cursor.execute('SELECT * FROM {table}'.format(table=table))
 results = cursor.fetchall()
 
 for result in results:
-    query = 'INSERT INTO {table} ({columns}) VALUES ({values})'.format(table=table, columns=result.keys(), values=result.items())
+    query = 'INSERT INTO {table} ({columns}) VALUES ({values})'.format(table=table, columns=result.keys(), values=result.values())
     print query
 
 
