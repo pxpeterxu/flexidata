@@ -127,8 +127,6 @@ class Cursor(object):
         create_schema, add_schema, modify_schema = generate_new_schema(
             original_schema, query_schema)
 
-        print schemas
-
         # If we need to change the schema
         if add_schema or modify_schema:
             # TODO(hsource) Currently all and any schema changes result in a new table; wasteful
@@ -136,10 +134,6 @@ class Cursor(object):
 
             # Create from old table
             if old_table_version is not None:
-                print original_schema
-                print query_schema
-                print add_schema
-                print modify_schema
                 old_table_name = make_real_table_name(table_name, old_table_version)
                 create_table_sql = generate_create_table_using_like(real_table_name, old_table_name)
                 shared_columns = [column for column in create_schema
@@ -821,13 +815,12 @@ def retrieve_schemas(conn):
     primary_keys = {}
 
     for table in tables:
-        print 'SHOW COLUMNS FROM {}'.format(table)
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
         all2 = cur.fetchall()
         if all2 is None or (len(all2) != 0 and u'Field' not in all2[0]):
             cur.execute('SHOW COLUMNS FROM {}'.format(table))
             all2 = cur.fetchall()
-        print all2
+
         tables_info[table] = OrderedDict()
         for col_info in all2:
             column_name = col_info[u'Field']
