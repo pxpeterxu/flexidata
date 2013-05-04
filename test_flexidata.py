@@ -44,3 +44,10 @@ for sql_statement in sql_statements:
         conn.commit()
 
     times.append(time.time() - start_time)
+
+i = 1
+for time in times:
+    print "{i},{time}".format(i=i, time=time)
+    i += 1
+
+
