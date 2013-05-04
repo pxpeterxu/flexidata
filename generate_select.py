@@ -34,4 +34,4 @@ preferred_names.remove('')
 
 if '4' in types_to_generate:
     for i in xrange(1, int(queries_to_make)):
-        print 'SELECT netId, firstName, lastName, preferredName, college, classYear, facebookId FROM Students2 WHERE facebookId > 10000000000'
+        print 'SELECT netId, firstName, lastName, preferredName, college, schoolYear facebookId FROM Students2 WHERE facebookId > 10000000000'
