@@ -2,19 +2,20 @@ __author__ = 'User'
 
 import sqlparse
 import sqlparse.sql
+import threading
 
 from flexidata import *
 
 conn = Connection(original_conn)
-cur = conn.cursor()
 
 def get_table_migration_states(conn):
     """
+    Gets the table migration status from the database.
 
     :param conn:
     :type conn: flexidata.Connection
     :return: a dict of real_table_name => last_id_processed
-    :rtype:
+    :rtype: dict of (str, int)
     """
     cur = conn.cursor()
     if 'migrations' not in conn.schemas:
@@ -60,10 +61,36 @@ def migrate_table(conn, subtable_name, last_processed, num_to_process):
 
     conn.commit()
 
-    new_last_processed = last_processed + num_to_process
+    new_last_processed = cur.lastrowid
     # TODO(harryyu) Note that if there are gaps in the primary key, rows can be processed twice
     cur.execute("INSERT INTO migrations (destination, last_id_processed) VALUES ('{1}', {2}) \n"
                 "ON DUPLICATE KEY UPDATE SET last_id_processed = {2}".format(subtable_name,
                                                                              new_last_processed))
     conn.commit()
     return new_last_processed
+
+class MigrateThread(threading.Thread):
+
+    def __init__(self):
+        super(MigrateThread, self).__init__()
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def stopped(self):
+        return self._stop.isSet()
+
+    def run(self, seconds_per_check, rows_per_check, busy_processes_threshold, table_priority):
+        """
+        Runs the thread to automatically run DB migrations.
+
+        :param seconds_per_check: How many seconds (including decimals) to wait between checks
+        :param rows_per_check: How many rows to update per successful check
+        :param busy_processes_threshold: How many processes running to disallow the run
+        :param table_priority: List of tables to process in order
+        :type table_priority: list | None
+        """
+        global conn
+        tables_last_processed = get_table_migration_states(conn)
+

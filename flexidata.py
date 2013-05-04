@@ -85,22 +85,26 @@ class Cursor(object):
         :type cursor: pymysql.cursors.Cursor
         :type conn: Connection
         """
-        self.cursor = cursor
+        self.raw_cursor = cursor
         self.conn = conn
 
     @property
     def description(self):
-        return self.cursor.description
+        return self.raw_cursor.description
 
     @property
     def rowcount(self):
-        return self.cursor.rowcount
+        return self.raw_cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return self.raw_cursor.lastrowid
 
     def callproc(self, procname, args=()):
-        return self.cursor.callproc(procname, args)
+        return self.raw_cursor.callproc(procname, args)
 
     def close(self):
-        self.cursor.close()
+        self.raw_cursor.close()
 
     def _prepare_schema(self, table_name, query_schema):
         schemas = self.conn.schemas
@@ -134,13 +138,13 @@ class Cursor(object):
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
                                                        shared_columns)
                 modify_table_sql = generate_alter_table(real_table_name, add_schema, modify_schema)
-                self.cursor.execute(create_table_sql)
-                self.cursor.execute(modify_table_sql)
-                self.cursor.execute(create_trigger_sql)
+                self.raw_cursor.execute(create_table_sql)
+                self.raw_cursor.execute(modify_table_sql)
+                self.raw_cursor.execute(create_trigger_sql)
             else:
                 primary_key = primary_keys[table_name] if table_name in primary_keys else None
                 create_table_sql = generate_create_table(real_table_name, create_schema, primary_key)
-                self.cursor.execute(create_table_sql)
+                self.raw_cursor.execute(create_table_sql)
 
             self.conn._refresh_schemas()
         else:
@@ -200,9 +204,9 @@ class Cursor(object):
                                                self.conn.schemas[table_name],
                                                primary_key,
                                                where_token)
-        self.cursor.execute('SET @disable_triggers = 1;')
-        self.cursor.execute(propagate_sql)
-        self.cursor.execute('SET @disable_triggers = NULL;')
+        self.raw_cursor.execute('SET @disable_triggers = 1;')
+        self.raw_cursor.execute(propagate_sql)
+        self.raw_cursor.execute('SET @disable_triggers = NULL;')
 
     def _prepare_for_select(self, stmt):
         # Get basic information
@@ -290,36 +294,36 @@ class Cursor(object):
 
         stmts = [str(stmt) for stmt in stmts]
         query = ';\n'.join(stmts)
-        return self.cursor.execute(query)
+        return self.raw_cursor.execute(query)
 
     def executemany(self, query, args):
-        return self.cursor.executemany(query, args)
+        return self.raw_cursor.executemany(query, args)
 
     def fetchone(self):
-        return self.cursor.fetchone()
+        return self.raw_cursor.fetchone()
 
     def fetchmany(self, size=None):
-        return self.cursor.fetchmany(size)
+        return self.raw_cursor.fetchmany(size)
 
     def fetchall(self):
-        return self.cursor.fetchall()
+        return self.raw_cursor.fetchall()
 
     def nextset(self):
-        return self.cursor.nextset()
+        return self.raw_cursor.nextset()
 
     @property
     def arraysize(self):
-        return self.cursor.arraysize
+        return self.raw_cursor.arraysize
 
     @arraysize.setter
     def arraysize(self, value):
-        self.cursor.arraysize = value
+        self.raw_cursor.arraysize = value
 
     def setinputsizes(self, sizes):
-        self.cursor.setinputsizes(sizes)
+        self.raw_cursor.setinputsizes(sizes)
 
     def setoutputsize(self, size, column=None):
-        self.cursor.setoutputsizes(size, column)
+        self.raw_cursor.setoutputsizes(size, column)
 
 
 def find_tokens_until_match(token, until_token_filter):
