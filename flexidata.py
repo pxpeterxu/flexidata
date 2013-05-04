@@ -811,12 +811,12 @@ def retrieve_schemas(conn):
     for table in tables:
         cur.execute('SHOW COLUMNS FROM {}'.format(table))
         all2 = cur.fetchall()
-        if all2 is None:
+        if all2 is None or (len(all2) != 0 and u'Field' not in all2[0]):
             cur.execute('SHOW COLUMNS FROM {}'.format(table))
             all2 = cur.fetchall()
 
         tables_info[table] = OrderedDict()
-        for col_info in all2 or (len(all2) != 0 and u'Field' not in all2[0]):
+        for col_info in all2:
             column_name = col_info[u'Field']
             tables_info[table][column_name] = extract_type_data(col_info[u'Type'])
             if 'PRI' in col_info[u'Key']:
