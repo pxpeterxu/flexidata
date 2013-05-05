@@ -36,6 +36,7 @@ if conn_type == 'mysql':
     conn = original_conn
 elif conn_type == 'flexidata':
     conn = flexidata.Connection(original_conn)
+    conn.hint_primary_key('Students2', 'id')
 cursor = conn.cursor()
 
 times = []

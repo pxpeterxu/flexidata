@@ -13,11 +13,18 @@ from collections import defaultdict, OrderedDict
 import copy
 import settings
 
-original_conn = MySQLdb.connect(
-    db=settings.flexidata_database,
-    user=settings.flexidata_username,
-    passwd=settings.flexidata_password,
-    host=settings.flexidata_host)
+if settings.flexidata_host is not None:
+    original_conn = MySQLdb.connect(
+        db=settings.flexidata_database,
+        user=settings.flexidata_username,
+        passwd=settings.flexidata_password,
+        host=settings.flexidata_host)
+elif settings.flexidata_socket is not None:
+    original_conn = MySQLdb.connect(
+        db=settings.flexidata_database,
+        user=settings.flexidata_username,
+        passwd=settings.flexidata_password,
+        unix_socket=settings.flexidata_socket)
 
 
 class Connection(object):
