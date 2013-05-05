@@ -1,6 +1,6 @@
 import sys
 import flexidata
-import pymysql
+import MySQLdb
 import settings
 import time
 
@@ -21,7 +21,7 @@ f = open(filename)
 sql_statements = f.readlines()
 f.close()
 
-original_conn = pymysql.connect(
+original_conn = MySQLdb.connect(
     db=settings.flexidata_database,
     user=settings.flexidata_username,
     passwd=settings.flexidata_password,
