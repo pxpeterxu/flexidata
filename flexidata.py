@@ -5,7 +5,7 @@ from sqlparse import tokens as ptokens
 
 import sqlparse_enhanced as psqle
 
-import pymysql
+import MySQLdb
 import re
 import itertools
 
@@ -13,7 +13,7 @@ from collections import defaultdict, OrderedDict
 import copy
 import settings
 
-original_conn = pymysql.connect(
+original_conn = MySQLdb.connect(
     db=settings.flexidata_database,
     user=settings.flexidata_username,
     passwd=settings.flexidata_password,
@@ -27,7 +27,7 @@ class Connection(object):
 
     def __init__(self, conn):
         """
-        :type conn: pymysql.connections.Connection
+        :type conn: MySQLdb.connections.Connection
         """
         self.conn = conn
         self.refresh_schemas()
@@ -79,7 +79,7 @@ class Cursor(object):
 
     def __init__(self, cursor, conn):
         """
-        :type cursor: pymysql.cursors.Cursor
+        :type cursor: MySQLdb.cursors.Cursor
         :type conn: Connection
         """
         self.raw_cursor = cursor
@@ -130,6 +130,15 @@ class Cursor(object):
             if old_table_version is not None:
                 old_table_name = make_real_table_name(table_name, old_table_version)
                 create_table_sql = generate_create_table_using_like(real_table_name, old_table_name)
+
+                dict_cursor = self.conn.conn.cursor(MySQLdb.cursors.DictCursor)
+                old_table_auto_increment_sql = "SHOW TABLE STATUS LIKE '{}'".format(old_table_name)
+                dict_cursor.execute(old_table_auto_increment_sql)
+                auto_increment = dict_cursor.fetchall()[0]['Auto_increment']
+                dict_cursor.close()
+                auto_increment_sql = "ALTER TABLE {} AUTO_INCREMENT = {}".format(real_table_name,
+                                                                                 auto_increment)
+
                 shared_columns = [column for column in create_schema
                                   if column not in add_schema and column not in modify_schema]
                 create_trigger_sql = generate_triggers(old_table_name, real_table_name,
@@ -137,11 +146,16 @@ class Cursor(object):
                 modify_table_sql = generate_alter_table(real_table_name, add_schema, modify_schema)
                 self.raw_cursor.execute(create_table_sql)
                 self.raw_cursor.execute(modify_table_sql)
+                self.raw_cursor.execute(auto_increment_sql)
                 self.raw_cursor.execute(create_trigger_sql)
             else:
                 primary_key = primary_keys[table_name] if table_name in primary_keys else None
                 create_table_sql = generate_create_table(real_table_name, create_schema, primary_key)
                 self.raw_cursor.execute(create_table_sql)
+
+            while self.raw_cursor.nextset():
+                pass
+            self.conn.commit()
 
             self.conn.refresh_schemas()
         else:
@@ -788,7 +802,7 @@ def retrieve_schemas(conn):
     """
     Gathers schema data from the raw (non-wrapped connection).
 
-    :type conn: pymysql.connections.Connection
+    :type conn: MySQLdb.connections.Connection
     :returns two dicts, one containing a table_name -> {'col' -> col_info} and the other containing
              table_name -> num_rows
     :rtype tuple of dict, integer
@@ -800,7 +814,7 @@ def retrieve_schemas(conn):
         return {}, {}, {}
     tables = [row[0] for row in rows]
 
-    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur = conn.cursor(MySQLdb.cursors.DictCursor)
 
     tables_info = {}
     primary_keys = {}
@@ -815,7 +829,7 @@ def retrieve_schemas(conn):
                 primary_keys[table] = column_name
 
     cur.execute("SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = "
-                "'{}'".format(conn.db))
+                "'{}'".format(settings.flexidata_database))
     tables_num_rows = {col_info[u'TABLE_NAME']: int(col_info['TABLE_ROWS'])
                        for col_info in cur.fetchall()}
 

@@ -32,7 +32,7 @@ original_cursor = original_conn.cursor()
 original_cursor.execute('SET SESSION query_cache_type = OFF')
 original_conn.commit()
 
-if conn_type == 'pymysql':
+if conn_type == 'mysql':
     conn = original_conn
 elif conn_type == 'flexidata':
     conn = flexidata.Connection(original_conn)
